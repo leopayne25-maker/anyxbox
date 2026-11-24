@@ -1,7 +1,8 @@
-"""Runtime GDK : état HDR de l'écran (XDisplay) et connectivité réseau (XNetworking) du PC.
+"""Runtime GDK : état HDR (XDisplay), réseau (XNetworking) et contraste élevé (XAccessibility) du PC.
 
-Structures et signatures : XDisplay.h et XNetworking.h du GDK public (version 261000).
-Les valeurs viennent de Windows (DXGI, Network List Manager) : rien n'est inventé.
+Structures et signatures : XDisplay.h et XNetworking.h du GDK public (version 261000), pages
+XNetworking et XAccessibility de Microsoft Learn. Les valeurs viennent de Windows (DXGI, Network
+List Manager, SPI_GETHIGHCONTRAST) ou de la réponse documentée du PC : rien n'est inventé.
 """
 import ctypes
 import math
@@ -92,3 +93,54 @@ def test_connectivity_changes_can_be_subscribed(runtime_dir):
 def test_other_networking_methods_are_not_implemented(runtime_dir):
     port = GdkInterface(runtime_dir, *NETWORKING).method(3, ctypes.c_uint32, ctypes.c_void_p)
     assert port(None) == E_NOTIMPL                     # XNetworkingQueryPreferredLocalUdpMultiplayerPort
+
+
+ACCESSIBILITY = ("3E241977-6237-41E9-8559-102C2D9983F1", "D722B373-8C4D-4692-9E51-D6AD9B37AA7D")
+TCP_BUFFER_KINDS = 3                                   # Title, System, Tools
+CONTRAST_OFF, CONTRAST_DARK, CONTRAST_LIGHT = 0, 1, 2
+SPI_GETHIGHCONTRAST, HCF_HIGHCONTRASTON = 0x0042, 0x1
+
+
+class TcpQueuedReceiveStatistics(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in
+                ("queued", "peak", "total", "dropped_for_max", "dropped_for_any_failure")]
+
+
+def test_tcp_buffer_settings_answer_like_a_pc(runtime_dir):
+    """Microsoft Learn : sur PC, lecture à 0, modification en E_NOTIMPL, statistiques à 0."""
+    api = GdkInterface(runtime_dir, *NETWORKING)
+    query = api.method(18, ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64))
+    configure = api.method(19, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint64)
+    statistics = api.method(20, ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(TcpQueuedReceiveStatistics))
+    for kind in range(TCP_BUFFER_KINDS):
+        value, usage = ctypes.c_uint64(99), TcpQueuedReceiveStatistics(1, 2, 3, 4, 5)
+        assert query(kind, ctypes.byref(value)) == S_OK and value.value == 0
+        assert configure(kind, 1 << 20) == E_NOTIMPL
+        assert statistics(kind, ctypes.byref(usage)) == S_OK
+        assert [getattr(usage, name) for name, _ in usage._fields_] == [0] * 5
+    assert query(TCP_BUFFER_KINDS, ctypes.byref(ctypes.c_uint64())) == E_INVALIDARG
+    assert configure(TCP_BUFFER_KINDS, 0) == E_INVALIDARG
+    assert statistics(TCP_BUFFER_KINDS, ctypes.byref(TcpQueuedReceiveStatistics())) == E_INVALIDARG
+
+
+class HighContrast(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("scheme", ctypes.c_wchar_p)]
+
+
+def test_high_contrast_mode_follows_windows(runtime_dir):
+    get = GdkInterface(runtime_dir, *ACCESSIBILITY).method(5, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32))
+    windows = HighContrast(ctypes.sizeof(HighContrast))
+    assert ctypes.windll.user32.SystemParametersInfoW(SPI_GETHIGHCONTRAST, windows.size, ctypes.byref(windows), 0)
+    mode = ctypes.c_uint32(7)
+    assert get(ctypes.byref(mode)) == S_OK
+    if windows.flags & HCF_HIGHCONTRASTON:
+        assert mode.value in (CONTRAST_DARK, CONTRAST_LIGHT)
+    else:
+        assert mode.value == CONTRAST_OFF
+    assert get(None) == E_INVALIDARG
+
+
+def test_captions_and_speech_are_not_implemented(runtime_dir):
+    api = GdkInterface(runtime_dir, *ACCESSIBILITY)
+    assert api.method(3, ctypes.c_uint32, ctypes.c_void_p)(None) == E_NOTIMPL     # XClosedCaptionGetProperties
+    assert api.method(9, ctypes.c_uint32, ctypes.c_void_p)(None) == E_NOTIMPL     # XSpeechSynthesizerCreate

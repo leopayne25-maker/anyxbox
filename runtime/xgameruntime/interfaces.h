@@ -59,6 +59,9 @@ void* StreamingInterface();
 // XGameUi : écrans confiés aux rappels du jeu, sans interface système (gameui_interface.cpp).
 void* GameUiInterface();
 
+// XAccessibility : contraste élevé réel de Windows (accessibility_interface.cpp).
+void* AccessibilityInterface();
+
 // Renvoie l'objet qui sert (fournisseur, interface), ou nullptr.
 void* ServedInterface(const GUID& provider, const GUID& iid);
 
