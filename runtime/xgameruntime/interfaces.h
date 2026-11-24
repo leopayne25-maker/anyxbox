@@ -56,6 +56,9 @@ void* StoreInterface();
 // XGameStreaming : jeu local, aucun client de streaming connecté (streaming_interface.cpp).
 void* StreamingInterface();
 
+// XGameUi : écrans confiés aux rappels du jeu, sans interface système (gameui_interface.cpp).
+void* GameUiInterface();
+
 // Renvoie l'objet qui sert (fournisseur, interface), ou nullptr.
 void* ServedInterface(const GUID& provider, const GUID& iid);
 

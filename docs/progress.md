@@ -80,7 +80,7 @@ On PC, each `X*` function of the GDK static library (`xgameruntime.lib`) calls `
 | Interface | Functions | Served by |
 |---|---|---|
 | `XStore` (+ 3 interface versions) | 70 | **AnyXboxX** (local license, empty products, offline purchase and download) |
-| `XGameUi` | 42 | Windows |
+| `XGameUi` | 42 | **AnyXboxX** (no system UI: dialogs go to the game's own UI callbacks, `E_NOTIMPL` without them) |
 | `XUser` (+ 4 interface versions, `XUserGetGamertag`) | 44 | **AnyXboxX** (offline profile) |
 | `XGameStreaming` | 32 | **AnyXboxX** (no streaming client: client queries answer `E_GAMESTREAMING_CLIENT_NOT_CONNECTED`) |
 | `XPackage` | 31 | Windows |
