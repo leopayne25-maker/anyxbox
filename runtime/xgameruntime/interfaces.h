@@ -53,6 +53,9 @@ void* NetworkingInterface();
 // XStore : Microsoft Store hors ligne (store_interface.cpp) : licence locale, produits vides.
 void* StoreInterface();
 
+// XGameStreaming : jeu local, aucun client de streaming connecté (streaming_interface.cpp).
+void* StreamingInterface();
+
 // Renvoie l'objet qui sert (fournisseur, interface), ou nullptr.
 void* ServedInterface(const GUID& provider, const GUID& iid);
 

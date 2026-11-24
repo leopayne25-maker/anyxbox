@@ -82,7 +82,7 @@ On PC, each `X*` function of the GDK static library (`xgameruntime.lib`) calls `
 | `XStore` (+ 3 interface versions) | 70 | **AnyXboxX** (local license, empty products, offline purchase and download) |
 | `XGameUi` | 42 | Windows |
 | `XUser` (+ 4 interface versions, `XUserGetGamertag`) | 44 | **AnyXboxX** (offline profile) |
-| `XGameStreaming` | 32 | Windows |
+| `XGameStreaming` | 32 | **AnyXboxX** (no streaming client: client queries answer `E_GAMESTREAMING_CLIENT_NOT_CONNECTED`) |
 | `XPackage` | 31 | Windows |
 | `XGameSave` (+ `XGameSaveFiles`) | 30 | **AnyXboxX** (PC disk) |
 | `XTaskQueue` / `XAsync` / `XThread` | 27 | **AnyXboxX** |
