@@ -87,6 +87,19 @@ Sur PC, chaque fonction `X*` de la bibliothèque statique du GDK (`xgameruntime.
 | `XGameSave` (+ `XGameSaveFiles`) | 30 | **AnyXboxX** (disque du PC) |
 | `XTaskQueue` / `XAsync` / `XThread` | 27 | **AnyXboxX** |
 
+
+### Abonnements : un jeton sans notification
+
+Trois abonnements à des changements servis par AnyXboxX réussissent (`S_OK` et un jeton qui se désinscrit normalement) mais **n'appellent jamais leur rappel** : AnyXboxX ne suit pas le changement qu'ils signalent. La requête correspondante rend toujours la valeur courante : un titre qui la relit voit le changement.
+
+| Abonnement | Changement non suivi | Valeur courante |
+|---|---|---|
+| `XNetworkingRegisterConnectivityHintChanged` | connectivité réseau du PC | `XNetworkingGetConnectivityHint` |
+| `XUserRegisterForDeviceAssociationChanged` | association manette-joueur (non modélisée) | aucune : `XUserFindControllerForUserWithUiAsync` rend l'identifiant nul documenté pour PC |
+| `XUserRegisterForDefaultAudioEndpointUtf16Changed` | périphérique audio de communication par défaut de Windows | `XUserGetDefaultAudioEndpointUtf16` |
+
+Renvoyer `E_NOTIMPL` ferait échouer l'inscription, qu'un titre peut traiter comme fatale au démarrage alors que les requêtes marchent : le jeton est gardé, et ce tableau dit ce qu'il ne fait pas.
+
 ## Identité Xbox Series X
 
 `XSystemGetDeviceType` n'est pas une interface : `xgameruntime.lib`, lié dans le jeu, lit `HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM`, valeur `ConsoleMode`. La valeur 0x64 donne `XboxScarlettAnaconda`, et l'absence de valeur donne `Pc`. En mode natif, AnyXboxX redirige les fonctions de registre du jeu **et des DLL de son dossier** vers un registre simulé (`runtime/xgameruntime/registry.cpp`) : seule cette clé est simulée, le reste va au vrai registre.

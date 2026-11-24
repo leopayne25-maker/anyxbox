@@ -87,6 +87,18 @@ On PC, each `X*` function of the GDK static library (`xgameruntime.lib`) calls `
 | `XGameSave` (+ `XGameSaveFiles`) | 30 | **AnyXboxX** (PC disk) |
 | `XTaskQueue` / `XAsync` / `XThread` | 27 | **AnyXboxX** |
 
+### Subscriptions: a token without notification
+
+Three change subscriptions served by AnyXboxX succeed (`S_OK` and a token that unregisters normally) but **never call their callback**: AnyXboxX does not track the change they report. The matching query always returns the current value, so a title that queries again sees the change.
+
+| Subscription | Change not tracked | Current value |
+|---|---|---|
+| `XNetworkingRegisterConnectivityHintChanged` | network connectivity of the PC | `XNetworkingGetConnectivityHint` |
+| `XUserRegisterForDeviceAssociationChanged` | controller-to-player association (not modelled) | none: `XUserFindControllerForUserWithUiAsync` gives the all-zero device id documented for PC |
+| `XUserRegisterForDefaultAudioEndpointUtf16Changed` | Windows' default communications audio device | `XUserGetDefaultAudioEndpointUtf16` |
+
+Returning `E_NOTIMPL` instead would make registration fail, which a title may treat as fatal at startup, although the queries work; the token is kept, and this table says what it does not do.
+
 ## Xbox Series X identity
 
 `XSystemGetDeviceType` is not an interface: `xgameruntime.lib`, linked into the game, reads `HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM`, value `ConsoleMode`. The value 0x64 gives `XboxScarlettAnaconda`, and a missing value gives `Pc`. In native mode, AnyXboxX redirects the registry functions of the game **and of the DLLs in its folder** to a simulated registry (`runtime/xgameruntime/registry.cpp`): only this key is simulated, the rest goes to the real registry.

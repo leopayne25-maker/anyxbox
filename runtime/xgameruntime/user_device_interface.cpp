@@ -7,8 +7,11 @@
 //   l'exemple de la page passe ensuite à IMMDeviceEnumerator::GetDevice.
 // - XUserFindControllerForUserWithUiAsync : « On desktop, this function will not show UI », et
 //   le résultat est « always ... an all-zero device ID ».
-// - Les abonnements réussissent avec un jeton : AnyXboxX ne suit ni les changements
-//   d'association manette-joueur ni ceux du périphérique audio, le rappel ne part jamais.
+// - Abonnements XUserRegisterForDeviceAssociationChanged et
+//   XUserRegisterForDefaultAudioEndpointUtf16Changed : S_OK et un jeton, mais **sans notification**.
+//   AnyXboxX ne suit ni les associations manette-joueur ni les changements du périphérique audio
+//   par défaut de Windows : le rappel n'est jamais appelé. XUserGetDefaultAudioEndpointUtf16 rend
+//   la valeur courante à chaque appel. Choix documenté (docs/progress.md, « Subscriptions »).
 // XUserFindForDevice reste non écrit : la page ne dit pas ce que répond un PC.
 #include <windows.h>
 #include <mmdeviceapi.h>

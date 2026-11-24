@@ -120,7 +120,9 @@ HRESULT XNetworkingGetConnectivityHint(ConnectivityHint* hint) noexcept {
   return S_OK;
 }
 
-// Les changements de connectivité ne sont pas suivis : l'abonnement reçoit un jeton, sans rappel.
+// XNetworkingRegisterConnectivityHintChanged : S_OK et un jeton, **sans notification** : les
+// changements de connectivité ne sont pas suivis, le rappel n'est jamais appelé ;
+// XNetworkingGetConnectivityHint rend l'état courant à chaque appel (docs/progress.md, « Subscriptions »).
 HRESULT RegisterHintChanged(void*, void*, void* callback, void* token) noexcept {
   return anyxboxx::AddSubscription(callback, token);
 }
