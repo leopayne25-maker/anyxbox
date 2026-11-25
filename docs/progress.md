@@ -87,17 +87,17 @@ On PC, each `X*` function of the GDK static library (`xgameruntime.lib`) calls `
 | `XGameSave` (+ `XGameSaveFiles`) | 30 | **AnyXboxX** (PC disk) |
 | `XTaskQueue` / `XAsync` / `XThread` | 27 | **AnyXboxX** |
 
-### Subscriptions: a token without notification
+### Change subscriptions: not implemented
 
-Three change subscriptions served by AnyXboxX succeed (`S_OK` and a token that unregisters normally) but **never call their callback**: AnyXboxX does not track the change they report. The matching query always returns the current value, so a title that queries again sees the change.
+AnyXboxX does not track the change these three subscriptions report, so it could never call their callback. Following rule 3 (no fake success), registering returns `E_NOTIMPL` and is logged with the trace (`ANYXBOXX_TRACE=1`), no token is written, and unregistering returns `false` (nothing can be registered). The matching query always returns the current value, so a title that queries again sees the change.
 
-| Subscription | Change not tracked | Current value |
+| Subscription (`E_NOTIMPL`) | Change not tracked | Current value |
 |---|---|---|
 | `XNetworkingRegisterConnectivityHintChanged` | network connectivity of the PC | `XNetworkingGetConnectivityHint` |
 | `XUserRegisterForDeviceAssociationChanged` | controller-to-player association (not modelled) | none: `XUserFindControllerForUserWithUiAsync` gives the all-zero device id documented for PC |
 | `XUserRegisterForDefaultAudioEndpointUtf16Changed` | Windows' default communications audio device | `XUserGetDefaultAudioEndpointUtf16` |
 
-Returning `E_NOTIMPL` instead would make registration fail, which a title may treat as fatal at startup, although the queries work; the token is kept, and this table says what it does not do.
+A title that treats a failed registration as fatal stops here, and the trace shows the refused call (`E_NOTIMPL`). Maintainer's decision on #156 (no exception to rule 3).
 
 ## Xbox Series X identity
 

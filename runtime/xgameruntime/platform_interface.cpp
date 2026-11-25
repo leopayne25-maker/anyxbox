@@ -120,13 +120,11 @@ HRESULT XNetworkingGetConnectivityHint(ConnectivityHint* hint) noexcept {
   return S_OK;
 }
 
-// XNetworkingRegisterConnectivityHintChanged : S_OK et un jeton, **sans notification** : les
-// changements de connectivité ne sont pas suivis, le rappel n'est jamais appelé ;
-// XNetworkingGetConnectivityHint rend l'état courant à chaque appel (docs/progress.md, « Subscriptions »).
-HRESULT RegisterHintChanged(void*, void*, void* callback, void* token) noexcept {
-  return anyxboxx::AddSubscription(callback, token);
-}
-bool UnregisterHintChanged(uint64_t token, bool) noexcept { return anyxboxx::RemoveSubscription(token); }
+// XNetworkingRegisterConnectivityHintChanged : E_NOTIMPL, journalisé (règle 3) : les changements de
+// connectivité ne sont pas suivis, le rappel ne serait jamais appelé ; XNetworkingGetConnectivityHint
+// rend l'état courant à chaque appel (docs/progress.md, « Change subscriptions »). Aucune inscription ne
+// peut réussir : le désabonnement n'a rien à retirer.
+bool UnregisterHintChanged(uint64_t, bool) noexcept { return false; }
 
 // --- XNetworking : réglages et statistiques des tampons TCP de réception ---------------
 // Ces tampons n'existent que sur console. Microsoft Learn documente la réponse du PC, qui est
@@ -188,7 +186,7 @@ void* const kNetworkingMethods[] = {
     ANYXBOXX_NOT_IMPLEMENTED,  // 13 XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult
     ANYXBOXX_NOT_IMPLEMENTED,  // 14 XNetworkingVerifyServerCertificate
     ANYXBOXX_METHOD(XNetworkingGetConnectivityHint),  // 15
-    ANYXBOXX_METHOD(RegisterHintChanged),  // 16 XNetworkingRegisterConnectivityHintChanged
+    ANYXBOXX_NOT_IMPLEMENTED,  // 16 XNetworkingRegisterConnectivityHintChanged
     ANYXBOXX_METHOD(UnregisterHintChanged),  // 17 XNetworkingUnregisterConnectivityHintChanged
     ANYXBOXX_METHOD(XNetworkingQueryConfigurationSetting),  // 18
     ANYXBOXX_METHOD(XNetworkingSetConfigurationSetting),  // 19 (E_NOTIMPL documenté sur PC)

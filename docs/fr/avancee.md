@@ -88,17 +88,17 @@ Sur PC, chaque fonction `X*` de la bibliothèque statique du GDK (`xgameruntime.
 | `XTaskQueue` / `XAsync` / `XThread` | 27 | **AnyXboxX** |
 
 
-### Abonnements : un jeton sans notification
+### Abonnements aux changements : non implémentés
 
-Trois abonnements à des changements servis par AnyXboxX réussissent (`S_OK` et un jeton qui se désinscrit normalement) mais **n'appellent jamais leur rappel** : AnyXboxX ne suit pas le changement qu'ils signalent. La requête correspondante rend toujours la valeur courante : un titre qui la relit voit le changement.
+AnyXboxX ne suit pas le changement que signalent ces trois abonnements : il ne pourrait jamais appeler leur rappel. Selon la règle 3 (pas de faux succès), l'inscription renvoie `E_NOTIMPL` et est journalisée par la trace (`ANYXBOXX_TRACE=1`), aucun jeton n'est écrit, et la désinscription rend `false` (rien ne peut être inscrit). La requête correspondante rend toujours la valeur courante : un titre qui la relit voit le changement.
 
-| Abonnement | Changement non suivi | Valeur courante |
+| Abonnement (`E_NOTIMPL`) | Changement non suivi | Valeur courante |
 |---|---|---|
 | `XNetworkingRegisterConnectivityHintChanged` | connectivité réseau du PC | `XNetworkingGetConnectivityHint` |
 | `XUserRegisterForDeviceAssociationChanged` | association manette-joueur (non modélisée) | aucune : `XUserFindControllerForUserWithUiAsync` rend l'identifiant nul documenté pour PC |
 | `XUserRegisterForDefaultAudioEndpointUtf16Changed` | périphérique audio de communication par défaut de Windows | `XUserGetDefaultAudioEndpointUtf16` |
 
-Renvoyer `E_NOTIMPL` ferait échouer l'inscription, qu'un titre peut traiter comme fatale au démarrage alors que les requêtes marchent : le jeton est gardé, et ce tableau dit ce qu'il ne fait pas.
+Un titre qui traite une inscription refusée comme fatale s'arrête ici, et la trace montre l'appel refusé (`E_NOTIMPL`). Décision du mainteneur sur #156 (pas d'exception à la règle 3).
 
 ## Identité Xbox Series X
 

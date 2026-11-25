@@ -13,6 +13,7 @@ from test_runtime_events import E_INVALIDARG, E_NOTIMPL, EVENT_CALLBACK
 
 USER_DEVICE = ("7D824997-10DC-45AB-86B7-2737767C0BF1", "0CC6A956-E7E1-4FDF-9341-9D5DA649EBC8")
 LOCAL_ID, RENDER, CAPTURE = 1, 0, 1
+UNTOUCHED = 0x5EED_5EED_5EED_5EED
 E_NOTFOUND, E_INSUFFICIENT_BUFFER = 0x80070490, 0x8007007A
 CLSID_ENUMERATOR, IID_ENUMERATOR = "BCDE0395-E52F-467C-8E3D-C4579291692E", "A95664D2-9614-4F35-A746-DE8DB63617E6"
 E_RENDER, E_CAPTURE, E_COMMUNICATIONS = 0, 1, 2
@@ -86,15 +87,16 @@ def test_controller_search_on_pc_returns_an_all_zero_device(runtime_dir):
     tasks.method(17, None, ctypes.c_void_p)(queue)
 
 
-def test_association_and_endpoint_changes_can_be_subscribed(runtime_dir):
+def test_association_and_endpoint_subscriptions_are_not_implemented(runtime_dir):
+    """Règle 3 : AnyXboxX ne suit pas ces changements, l'abonnement ne réussit pas (pas de jeton écrit)."""
     api = GdkInterface(runtime_dir, *USER_DEVICE)
     for register, unregister in ((4, 5), (7, 8)):
         subscribe = api.method(register, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                                ctypes.POINTER(ctypes.c_uint64))
         unsubscribe = api.method(unregister, ctypes.c_bool, ctypes.c_uint64, ctypes.c_bool)
-        callback, token = EVENT_CALLBACK(lambda context, value: None), ctypes.c_uint64()
-        assert subscribe(None, None, ctypes.cast(callback, ctypes.c_void_p), ctypes.byref(token)) == S_OK
-        assert unsubscribe(token.value, True) is True and unsubscribe(token.value, True) is False
+        callback, token = EVENT_CALLBACK(lambda context, value: None), ctypes.c_uint64(UNTOUCHED)
+        assert subscribe(None, None, ctypes.cast(callback, ctypes.c_void_p), ctypes.byref(token)) == E_NOTIMPL
+        assert token.value == UNTOUCHED and unsubscribe(token.value, True) is False
 
 
 def test_finding_the_user_of_a_device_is_not_implemented(runtime_dir):

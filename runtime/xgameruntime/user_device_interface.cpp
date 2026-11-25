@@ -8,10 +8,10 @@
 // - XUserFindControllerForUserWithUiAsync : « On desktop, this function will not show UI », et
 //   le résultat est « always ... an all-zero device ID ».
 // - Abonnements XUserRegisterForDeviceAssociationChanged et
-//   XUserRegisterForDefaultAudioEndpointUtf16Changed : S_OK et un jeton, mais **sans notification**.
-//   AnyXboxX ne suit ni les associations manette-joueur ni les changements du périphérique audio
-//   par défaut de Windows : le rappel n'est jamais appelé. XUserGetDefaultAudioEndpointUtf16 rend
-//   la valeur courante à chaque appel. Choix documenté (docs/progress.md, « Subscriptions »).
+//   XUserRegisterForDefaultAudioEndpointUtf16Changed : E_NOTIMPL, journalisé (règle 3). AnyXboxX ne
+//   suit ni les associations manette-joueur ni les changements du périphérique audio par défaut de
+//   Windows, il ne pourrait jamais appeler le rappel. XUserGetDefaultAudioEndpointUtf16 rend la
+//   valeur courante à chaque appel (docs/progress.md, « Change subscriptions »).
 // XUserFindForDevice reste non écrit : la page ne dit pas ce que répond un PC.
 #include <windows.h>
 #include <mmdeviceapi.h>
@@ -105,20 +105,17 @@ HRESULT XUserFindControllerForUserWithUiResult(XAsyncBlock* async, LocalDeviceId
   return XAsyncGetResult(async, &kControllerIdentity, sizeof *device, device, nullptr);
 }
 
-// Abonnements (file, contexte, rappel, jeton) puis (jeton, attendre) : jamais de rappel.
-HRESULT Subscribe(void*, void*, void* callback, void* token) noexcept {
-  return anyxboxx::AddSubscription(callback, token);
-}
-bool Unsubscribe(uint64_t token, bool) noexcept { return anyxboxx::RemoveSubscription(token); }
+// Désabonnements (jeton, attendre) : aucune inscription ne peut réussir (E_NOTIMPL), rien à retirer.
+bool Unsubscribe(uint64_t, bool) noexcept { return false; }
 
 // Méthodes 3 à 10 de l'interface {0CC6A956…} (gdk_api_table.inc).
 void* const kUserDeviceMethods[] = {
     ANYXBOXX_IUNKNOWN_METHODS,                                // 0-2
     ANYXBOXX_NOT_IMPLEMENTED,  // 3 XUserFindForDevice
-    ANYXBOXX_METHOD(Subscribe),                               // 4 XUserRegisterForDeviceAssociationChanged
+    ANYXBOXX_NOT_IMPLEMENTED,  // 4 XUserRegisterForDeviceAssociationChanged
     ANYXBOXX_METHOD(Unsubscribe),                             // 5 XUserUnregisterForDeviceAssociationChanged
     ANYXBOXX_METHOD(XUserGetDefaultAudioEndpointUtf16),       // 6
-    ANYXBOXX_METHOD(Subscribe),                               // 7 XUserRegisterForDefaultAudioEndpointUtf16Changed
+    ANYXBOXX_NOT_IMPLEMENTED,  // 7 XUserRegisterForDefaultAudioEndpointUtf16Changed
     ANYXBOXX_METHOD(Unsubscribe),                             // 8 XUserUnregisterForDefaultAudioEndpointUtf16Changed
     ANYXBOXX_METHOD(XUserFindControllerForUserWithUiAsync),   // 9
     ANYXBOXX_METHOD(XUserFindControllerForUserWithUiResult),  // 10
