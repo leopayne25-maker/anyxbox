@@ -455,6 +455,53 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// slots that wait for such a look now.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// The longest wait, in frames, between two looks at a slot with nothing
+/// to upload: the frames of about four seconds at `frame_ms` per frame,
+/// between 16 and 256.
+pub(crate) fn look_cap(frame_ms: u64) -> u64 {
+    (4000 / frame_ms.max(1)).clamp(16, 256)
+}
+
+/// Whether the interval behind [`look_cap`] is a frame's (the default) and
+/// not the time since the last call of the pass
+/// (`VICTORY_TEXTURE_LOOK_BY_FRAME=0`).
+fn look_by_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LOOK_BY_FRAME").is_none_or(|v| v != "0"))
+}
+
+/// The longest wait between looks, in frames, at the last pass (frame line).
+pub(crate) static HEAP_TEXTURES_LOOK_CAP: AtomicU64 = AtomicU64::new(0);
+
+/// The interval behind [`look_cap`]: the milliseconds between the first
+/// passes of two frames, whatever the passes in between (the pass also runs
+/// before the frame's first draw and before every draw of the title's bake).
+#[derive(Clone, Copy)]
+pub(crate) struct LookClock {
+    /// The frame of the last pass, and when the first pass of that frame ran.
+    frame: u64,
+    at: u64,
+    /// The interval measured at that first pass.
+    took: u64,
+}
+
+impl LookClock {
+    pub(crate) const fn new() -> LookClock {
+        LookClock { frame: u64::MAX, at: 0, took: 1 }
+    }
+
+    /// A pass of `frame` at `now_ms`: the interval to size the wait by.
+    /// `by_frame: false` is the former measure, the time since the last pass.
+    pub(crate) fn tick(&mut self, frame: u64, now_ms: u64, by_frame: bool) -> u64 {
+        if !by_frame || frame != self.frame {
+            self.took = now_ms.saturating_sub(self.at).max(1);
+            self.at = now_ms;
+            self.frame = frame;
+        }
+        self.took
+    }
+}
+
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
 fn heap_recheck() -> bool {
@@ -1876,10 +1923,18 @@ impl State {
         // half a frame per second, while the title streams by the clock.
         // (About a second before the runtime told of the memory it maps:
         // the looks are now only for what that does not tell.)
-        static PASSED: AtomicU64 = AtomicU64::new(0);
+        // The interval is that between the frames' first passes, not between
+        // two calls: this function also runs before the first draw and before
+        // every draw of the title's bake (`early_textures`), so the gap since
+        // the previous call was a few milliseconds, `most` came out at 256,
+        // and at 10 fps a slot with nothing to upload waited some 25 s for
+        // its next look (a 5-minute run: 800-900 slots queued for good, and
+        // 11,118 looks in all). `VICTORY_TEXTURE_LOOK_BY_FRAME=0`: as before.
         let now = crate::host::now_ms();
-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        static LOOK: std::sync::Mutex<LookClock> = std::sync::Mutex::new(LookClock::new());
+        let took = LOOK.lock().unwrap_or_else(|e| e.into_inner()).tick(frame, now, look_by_frame());
+        let most = look_cap(took);
+        HEAP_TEXTURES_LOOK_CAP.store(most, Ordering::Relaxed);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -3918,5 +3973,44 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod look_cap_tests {
+    use super::look_cap;
+
+    #[test]
+    fn a_frame_of_a_tenth_of_a_second_waits_forty_frames() {
+        assert_eq!(look_cap(100), 40);
+    }
+
+    #[test]
+    fn a_few_milliseconds_between_calls_is_the_longest_wait() {
+        // The reading that made 25 s of waiting at 10 fps.
+        assert_eq!(look_cap(3), 256);
+    }
+
+    #[test]
+    fn passes_within_a_frame_keep_the_frames_interval() {
+        use super::LookClock;
+        let mut clock = LookClock::new();
+        clock.tick(1, 1_000, true);
+        // The next frame's first pass 100 ms later, then two more passes of
+        // that frame a few milliseconds apart (the early and bake passes).
+        assert_eq!(clock.tick(2, 1_100, true), 100);
+        assert_eq!(clock.tick(2, 1_103, true), 100);
+        assert_eq!(look_cap(clock.tick(2, 1_105, true)), 40);
+        // The former measure: the gap since the last pass.
+        let mut old = LookClock::new();
+        old.tick(1, 1_000, false);
+        old.tick(2, 1_100, false);
+        assert_eq!(look_cap(old.tick(2, 1_103, false)), 256);
+    }
+
+    #[test]
+    fn slow_frames_keep_the_floor_and_zero_is_safe() {
+        assert_eq!(look_cap(2000), 16);
+        assert_eq!(look_cap(0), 256);
     }
 }
