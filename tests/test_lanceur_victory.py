@@ -14,18 +14,23 @@ VICTORY = RACINE / "third_party" / "victory"
 # play.ps1 de Neptune (VIctory Edit.) 2026-11-25c, chemin Series X : la table du lanceur doit être exactement celle-ci
 # (sans VICTORY_WAVE_OWN_LDS_GROUPS, que le code de Neptune ne lit pas).
 NEPTUNE = {
-    "VICTORY_CARD_WINDOWS_MB": "4096", "VICTORY_BAKE_TEXTURES_MS": "10000", "VICTORY_EARLY_TEXTURES_MS": "40",
+    "VICTORY_BAKE_TEXTURES_MS": "10000", "VICTORY_EARLY_TEXTURES_MS": "40",
     "VICTORY_WIDE_MERGE": "1", "VICTORY_RELAY_OWN_QUEUE": "1",
     "VICTORY_UNDER_WRITES_WORDS": "1", "VICTORY_UNDER_WRITES_RUNS": "100000", "VICTORY_UNDER_WRITES_MASKS": "1",
     "VICTORY_RELAY": "2", "VICTORY_WIDE_REFRESH": "1", "VICTORY_ASK_ONCE": "1", "VICTORY_TEXTURE_NO_WAIT": "1",
     "VICTORY_CARD_REHASH_RUNS": "1", "VICTORY_JOIN_COPIES": "1", "VICTORY_D3D12_BACKGROUND": "0",
-    "VICTORY_LATE_WAIT_LISTS": "1024", "VICTORY_WINDOW_TAILS": "1", "VICTORY_TEXTURE_STAGE_MB": "512",
+    "VICTORY_LATE_WAIT_LISTS": "1024", "VICTORY_WINDOW_TAILS": "1",
     "VICTORY_CARD_BUFFERS_MIN_KB": "64", "VICTORY_ASK_QUIET": "8", "VICTORY_COPY_CHANGED": "1",
-    "VICTORY_QUIET_BACK": "1", "VICTORY_LIST_POOL_MOST": "2048", "VICTORY_LIST_POOL_MB": "2048",
+    "VICTORY_QUIET_BACK": "1",
     "VICTORY_WIDE_THREADS": "12", "VICTORY_UNDER_WRITES_MASKS_LEAST": "1", "VICTORY_INDIRECT_RAW": "2",
     "VICTORY_TEXTURE_HASH_EVERY": "32", "VICTORY_LEVELS_ON_DEMAND": "1", "VICTORY_WINDOW_KB": "1024",
-    "VICTORY_CARD_BUFFERS_MB": "1536", "VICTORY_CARD_WINDOW_UPLOAD": "1", "VICTORY_DROP_DXIL": "1",
+    "VICTORY_CARD_WINDOW_UPLOAD": "1", "VICTORY_DROP_DXIL": "1",
     "VICTORY_DESC_DATA": "1", "VICTORY_VRAM_IDLE_MS": "15000,2500,1000", "VICTORY_PIPELINE_WAIT_MS": "2500",
+}
+# Dimensionnés par le moteur d'après la carte et la RAM (memplan) : les poser à la main reste possible, pas ici.
+PLAFONDS_DU_MOTEUR = {
+    "VICTORY_CARD_WINDOWS_MB", "VICTORY_CARD_BUFFERS_MB", "VICTORY_LIST_POOL_MOST", "VICTORY_LIST_POOL_MB",
+    "VICTORY_TEXTURE_STAGE_MB",
 }
 # Absentes du code de VIctory (base Neptune) : les poser ne change rien.
 ABSENTES = (
@@ -78,6 +83,8 @@ def test_launcher_sets_neptunes_switch_set_and_can_turn_it_off():
     texte = _lanceur()
     table = dict(re.findall(r"^\s*(VICTORY_[A-Z0-9_]+)\s*=\s*'([^']*)'", _table(texte), re.MULTILINE))
     assert table == NEPTUNE
+    # Les plafonds de mémoire sont dimensionnés par le moteur (carte et RAM) : le lanceur ne les pose plus.
+    assert not set(table) & PLAFONDS_DU_MOTEUR
     assert "$NoTunedSettings" in texte and "-not $NoTunedSettings" in texte
 
 

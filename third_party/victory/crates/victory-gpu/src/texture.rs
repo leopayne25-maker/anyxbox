@@ -446,12 +446,12 @@ static STAGE_POOL: Mutex<StagePool> = Mutex::new(StagePool { free: Vec::new(), b
 /// Upload buffers taken from the pool, and made, since the start.
 pub(crate) static STAGE_POOLED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// The most bytes the pool keeps (`VICTORY_STAGE_POOL_MB`, 256; 0: no pool, a buffer of its
+/// The most bytes the pool keeps (`VICTORY_STAGE_POOL_MB`, else `memplan`'s: 256 MB on a PC of 31 GiB or more; 0: no pool, a buffer of its
 /// own for every staging buffer, as before).
 fn stage_pool_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_STAGE_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+        crate::memplan::current().stage_pool
     })
 }
 

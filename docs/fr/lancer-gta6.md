@@ -15,7 +15,7 @@ Le lancement passe par [VIctory](https://github.com/Marvisak/VIctory) (Marvisak,
 .\tools\lancer_victory.ps1 -GameDir <dossier du jeu>         # ensuite
 ```
 
-Le lanceur compile le profil release (`-Diag` ou `-Dred` pour la build de diagnostic) et pose le jeu de réglages du `play.ps1` de Neptune pour le chemin Series X (carte de 16 Go : baisser `VICTORY_CARD_WINDOWS_MB` et `VICTORY_CARD_BUFFERS_MB` sur une carte plus petite). `-Warm` lance `victory.exe warm` sur les seuls fichiers `.rpf` du dossier du jeu. `-AutoA` appuie sur A pendant les écrans de démarrage, `-FrametimeDump` écrit un CSV des temps d'image dans le dossier du cache. En jeu, F10 masque les chiffres du coin et F12 enregistre une image dans Images.
+Le lanceur compile le profil release (`-Diag` ou `-Dred` pour la build de diagnostic) et pose le jeu de réglages du `play.ps1` de Neptune pour le chemin Series X (le moteur dimensionne ses plafonds de mémoire d'après le budget de mémoire vidéo de la carte et la RAM du PC, donc une carte plus petite n'exige aucun changement ; poser `VICTORY_CARD_WINDOWS_MB`, `VICTORY_CARD_BUFFERS_MB`, `VICTORY_LIST_POOL_MOST`, `VICTORY_LIST_POOL_MB` ou `VICTORY_TEXTURE_STAGE_MB` à la main les remplace). `-Warm` lance `victory.exe warm` sur les seuls fichiers `.rpf` du dossier du jeu. `-AutoA` appuie sur A pendant les écrans de démarrage, `-FrametimeDump` écrit un CSV des temps d'image dans le dossier du cache. En jeu, F10 masque les chiffres du coin et F12 enregistre une image dans Images.
 
 Mesuré par le mainteneur le 25 novembre (RTX 4070 SUPER, i7-13700KF, chemin Series X en 4K, monde, après `warm`, build release) : médiane d'environ 12,5 fps, environ 15 fps sur la dernière minute, pointes à 30, environ 7 500 draws par image, sans plantage ; la base précédente tournait à environ 5 fps au même endroit. Problèmes connus (notes de Neptune) : objets et vêtements noirs un instant pendant le remplacement de leurs textures, parties du monde absentes derrière certaines portes et sur certains toits, pas d'animation faciale, sauts du temps d'image pendant le streaming ; la lumière intérieure est une lumière ambiante uniforme à la place de l'éclairage en lancer de rayons.
 
@@ -76,7 +76,7 @@ Réglages de ce lancement (non posés par le lanceur ; Linux seulement) :
 | `VICTORY_PIPELINE_WAIT_MS` | `50` | Attente des pipelines côté hôte par image. |
 | `VICTORY_TEXTURE_BUDGET_MB` | `8192` | Budget de textures pour une carte de 16 Go. |
 | `VICTORY_TEXTURE_NO_WAIT` | `1` | Les rafraîchissements de textures n'attendent pas la mémoire du titre. |
-| `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, `1024` | Comme le lanceur. |
+| `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, selon la carte | Le second suit le budget de la carte sauf s'il est posé (1 536 sur une carte de 16 Go). |
 | `VKD3D_CONFIG` | `descriptor_heap` | Le titre demande 1 245 184 vues, plus que le plafond par défaut de vkd3d-proton. |
 | `VICTORY_SKIP_PIPELINES` | 9 empreintes de shaders | `7f05ddab771799a9`, `a53a7977fe762268`, `be14e72d86362031`, `32ed072b9f845048`, `a1b20bc47e3c9597`, `17829ac71aab4e8d`, `e8c962358d862e3f`, `559d9f0184e15fe3`, `afeea48bbb9913ad`. |
 | `VICTORY_L7_SKIP` | `rt,gi,reflections` | Avec une table des rôles locale (`VICTORY_L7_ROLES`) : ces passes coûtent du temps et ne dessinent rien tant que le ray tracing ne tourne pas. |
@@ -298,7 +298,7 @@ Le script règle les variables ci-dessous (sauf avec `-NoTunedSettings`, qui ne 
 | `VICTORY_LATE_WAIT` | `3` | Réglage d'attente des pipelines côté hôte, de la pull request n°1 du fork. |
 | `VICTORY_WIDE_BACK` | `1` | Option du fork, active dans l'essai mesuré. |
 | `VICTORY_RELAY` | non posé | Option du fork, plus posée par défaut (issue n°89 du fork : la peau disparaît, les sous-titres se superposent) ; `2` était actif dans les essais mesurés de `7b0f736` et du lot 4. |
-| `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, `1024` | Dimensionnement des tampons de carte, en Mo. |
+| `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, selon la carte | Dimensionnement des tampons de carte, en Mo ; le second suit le budget de la carte sauf s'il est posé. |
 | `VICTORY_DSTORAGE_NOTIFY` | `1` | Les écritures DirectStorage dans des pages physiques sont signalées au côté GPU (commits du fork `e49864a` et `bf870de` de Yorivel, issue #62 du fork) : sans elle, les murs de la première pièce peuvent lire des copies périmées et paraître transparents. |
 | `VICTORY_STAGING_POOL_MB` | `1024` | Les tampons d'envoi des textures choisies par index sont gardés pour resservir, jusqu'à ce nombre de Mo, au lieu d'un tampon créé et mappé à chaque envoi (`0` n'en garde aucun). Mesuré sur une RTX 5080 (pilote 621.01, journaux de VIctory, deux lancements dans chaque cas, 25 novembre) : à l'entrée dans le monde, le passage sous 2,5 i/s dure environ 40 s au lieu d'environ 80 s, et la passe des textures des 100 premières secondes prend 190 ms par image au lieu de 560 à 730 ms ; rien ne change une fois la file vide (3,4 à 3,5 i/s dans les deux cas). |
 

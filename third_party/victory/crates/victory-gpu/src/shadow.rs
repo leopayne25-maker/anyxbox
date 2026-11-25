@@ -156,16 +156,19 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (by default `memplan`: 1,536 MB
+/// on a card of the reference budget, less on a smaller one).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
-    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    *LIMITS.get_or_init(|| {
+    // The total is the plan's, asked each time: `memplan` keeps it once the card has
+    // answered for its budget, and a value kept here before that would be the floor's.
+    static LEAST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let least = *LEAST.get_or_init(|| {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
+        // From 1 MiB up (it was 16, and 512 MB in all):
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
@@ -176,8 +179,9 @@ fn card_limits() -> (u64, u64) {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), |kb| (kb << 10).max(64 << 10));
-        (least, mb("VICTORY_CARD_BUFFERS_MB", 1024))
-    })
+        least
+    });
+    (least, crate::memplan::current().card_buffers)
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -350,18 +354,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        // (Neptune) Unset: 4,096 MB where the system gives the process 14 GB of
-        // the card or more (a 16 GB card: the windows then have room beside the
-        // textures, and draws stop reading their vertices over the bus; the first
-        // launches with it had every wall and body), none on a smaller card.
-        let unset = || match host().and_then(|h| h.video_memory()) {
-            Some([budget, ..]) if budget >= 14 << 30 => 4096,
-            _ => 0,
-        };
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or_else(unset) << 20
-    })
+    // (Neptune) Unset: 4,096 MB where the system gives the process 14 GB of
+    // the card or more, none on a smaller card. Now the plan's (`memplan`): 4,096 MB at a
+    // budget of 14.4 GiB or more, less in proportion below, 256 MB at the least;
+    // `VICTORY_CARD_WINDOWS_MB` wins. Asked each time: `memplan` keeps it once the card
+    // has answered for its budget, and a value kept here before that would be the floor's.
+    crate::memplan::current().card_windows
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).

@@ -18,7 +18,8 @@ const ALIGN: u64 = 256;
 fn most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOW_UPLOAD_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(512) << 20
+        // (Neptune) The switch, else the plan (`memplan`: 512 MB on a PC of 31 GiB or more).
+        crate::memplan::current().window_upload
     })
 }
 

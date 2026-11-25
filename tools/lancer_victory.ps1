@@ -51,8 +51,10 @@
 .NOTES
   The switch set is Neptune (VIctory Edit.) 2026-11-25c's play.ps1 for the Series X path (no PC FidelityFX DLL, no
   VICTORY_AUTO_A unless -AutoA). Measured by the maintainer on 2026-11-25 (RTX 4070 SUPER, i7-13700KF, Series X 4K,
-  release build, after warm): about 12 fps in the world. It is tuned for a 16 GB card: on a smaller one, lower
-  VICTORY_CARD_WINDOWS_MB and VICTORY_CARD_BUFFERS_MB first. Discord Rich Presence stays off (VICTORY_DISCORD=0).
+  release build, after warm): about 12 fps in the world. The engine sizes its memory caps (card windows and buffers,
+  command-list pool, texture staging) from the card's budget and the PC's RAM, so a smaller card or less RAM needs no
+  change; set VICTORY_CARD_WINDOWS_MB, VICTORY_CARD_BUFFERS_MB, VICTORY_LIST_POOL_MOST, VICTORY_LIST_POOL_MB or
+  VICTORY_TEXTURE_STAGE_MB yourself to override. Discord Rich Presence stays off (VICTORY_DISCORD=0).
 
 .EXAMPLE
   .\tools\lancer_victory.ps1 -GameDir D:\Games\MyPackage -Warm
@@ -125,7 +127,10 @@ if (-not $NoTunedSettings) {
     # Neptune (VIctory Edit.) 2026-11-25c, play.ps1, Series X path. Its VICTORY_WAVE_OWN_LDS_GROUPS is left out: no code
     # of this tree reads it (Neptune's shader translator, from soldsawn/victory-nvidia-8gb, dropped that wave rule).
     $tuned = [ordered]@{
-        VICTORY_CARD_WINDOWS_MB          = '4096'      # draw data on the card (16 GB card)
+        # VICTORY_CARD_WINDOWS_MB, VICTORY_CARD_BUFFERS_MB, VICTORY_LIST_POOL_MOST, VICTORY_LIST_POOL_MB,
+        # VICTORY_TEXTURE_STAGE_MB (and the stage and window upload pools) are no longer set here: the engine sizes them from
+        # the card's video-memory budget and the PC's RAM (the old values of this table are what a 16 GB card with 32 GB of
+        # RAM gets). Setting one by hand, in the environment, still overrides the engine's choice.
         VICTORY_BAKE_TEXTURES_MS         = '10000'     # textures uploaded before the character bake
         VICTORY_EARLY_TEXTURES_MS        = '40'
         VICTORY_WIDE_MERGE               = '1'         # shader results merged back on several threads
@@ -142,20 +147,16 @@ if (-not $NoTunedSettings) {
         VICTORY_D3D12_BACKGROUND         = '0'
         VICTORY_LATE_WAIT_LISTS          = '1024'
         VICTORY_WINDOW_TAILS             = '1'
-        VICTORY_TEXTURE_STAGE_MB         = '512'
         VICTORY_CARD_BUFFERS_MIN_KB      = '64'
         VICTORY_ASK_QUIET                = '8'         # quiet memory asked about once a frame
         VICTORY_COPY_CHANGED             = '1'         # only bytes that differ go up to the card
         VICTORY_QUIET_BACK               = '1'         # copied-back shader results are not read again
-        VICTORY_LIST_POOL_MOST           = '2048'      # command lists kept, not made anew each frame
-        VICTORY_LIST_POOL_MB             = '2048'
         VICTORY_WIDE_THREADS             = '12'
         VICTORY_UNDER_WRITES_MASKS_LEAST = '1'         # small changes go up in one pass per buffer
         VICTORY_INDIRECT_RAW             = '2'         # indirect draws use the game's own arguments
         VICTORY_TEXTURE_HASH_EVERY       = '32'
         VICTORY_LEVELS_ON_DEMAND         = '1'         # card memory only for the mip levels the game holds
         VICTORY_WINDOW_KB                = '1024'
-        VICTORY_CARD_BUFFERS_MB          = '1536'
         VICTORY_CARD_WINDOW_UPLOAD       = '1'
         VICTORY_DROP_DXIL                = '1'
         VICTORY_DESC_DATA                = '1'         # shaders that read a descriptor as data translate

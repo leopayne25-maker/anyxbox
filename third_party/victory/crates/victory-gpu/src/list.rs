@@ -245,9 +245,8 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 
 /// The most host lists kept idle, and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
-/// do not share them, `VICTORY_SCRATCH_POOL=0`).
-#[cfg(windows)]
-const IDLE_MOST_USUAL: (usize, u64) = (128, 256 << 20);
+/// do not share them, `VICTORY_SCRATCH_POOL=0`): `crate::memplan`'s, sized from the PC's RAM
+/// (they were 128 lists and 256 MB).
 
 /// (Neptune) `VICTORY_LIST_POOL_MOST=<lists>` and `VICTORY_LIST_POOL_MB=<MiB>` raise the two
 /// limits: with a thousand lists in the air a frame's lists beyond the first 128 were
@@ -256,9 +255,9 @@ const IDLE_MOST_USUAL: (usize, u64) = (128, 256 << 20);
 fn idle_most() -> (usize, u64) {
     static MOST: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        let lists = std::env::var("VICTORY_LIST_POOL_MOST").ok().and_then(|v| v.parse().ok()).unwrap_or(IDLE_MOST_USUAL.0);
-        let bytes = std::env::var("VICTORY_LIST_POOL_MB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(IDLE_MOST_USUAL.1, |mb| mb << 20);
-        (lists, bytes)
+        // Unset, the two follow the PC's RAM (`memplan`).
+        let p = crate::memplan::current();
+        (p.list_pool_lists, p.list_pool_bytes)
     })
 }
 

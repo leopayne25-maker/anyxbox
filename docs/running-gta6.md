@@ -15,7 +15,7 @@ The launch goes through [VIctory](https://github.com/Marvisak/VIctory) (Marvisak
 .	ools\lancer_victory.ps1 -GameDir <game folder>         # after that
 ```
 
-The launcher builds the release profile (`-Diag` or `-Dred` for the diagnostics build) and sets Neptune's `play.ps1` switch set for the Series X path (16 GB card: lower `VICTORY_CARD_WINDOWS_MB` and `VICTORY_CARD_BUFFERS_MB` on a smaller one). `-Warm` runs `victory.exe warm` on the game folder's `.rpf` files only. `-AutoA` taps A through the start screens, `-FrametimeDump` writes a frame time CSV into the cache folder. In the game, F10 hides the figures in the corner and F12 saves a picture to Pictures.
+The launcher builds the release profile (`-Diag` or `-Dred` for the diagnostics build) and sets Neptune's `play.ps1` switch set for the Series X path (the engine sizes its memory caps from the card's video-memory budget and the PC's RAM, so a smaller card needs no change; set `VICTORY_CARD_WINDOWS_MB`, `VICTORY_CARD_BUFFERS_MB`, `VICTORY_LIST_POOL_MOST`, `VICTORY_LIST_POOL_MB` or `VICTORY_TEXTURE_STAGE_MB` by hand to override). `-Warm` runs `victory.exe warm` on the game folder's `.rpf` files only. `-AutoA` taps A through the start screens, `-FrametimeDump` writes a frame time CSV into the cache folder. In the game, F10 hides the figures in the corner and F12 saves a picture to Pictures.
 
 Measured by the maintainer on 25 November (RTX 4070 SUPER, i7-13700KF, Series X path at 4K, world, after `warm`, release build): median about 12.5 fps, about 15 fps over the last minute, peaks at 30, about 7,500 draws per frame, no crash; the previous base ran at about 5 fps there. Known issues (Neptune's notes): objects and clothes briefly black while their textures are swapped, parts of the world missing behind some doors and on some roofs, no facial animation, frame time jumps while the game streams; indoor light is an even ambient stand-in for the ray-traced lighting.
 
@@ -76,7 +76,7 @@ Settings of that run (not set by the launcher; Linux only):
 | `VICTORY_PIPELINE_WAIT_MS` | `50` | Host pipeline wait per frame. |
 | `VICTORY_TEXTURE_BUDGET_MB` | `8192` | Texture budget for a 16 GB card. |
 | `VICTORY_TEXTURE_NO_WAIT` | `1` | Texture refreshes do not wait for title memory. |
-| `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, `1024` | Same as the launcher. |
+| `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, from the card | The second is sized from the card's budget unless set (1,536 on a 16 GB card). |
 | `VKD3D_CONFIG` | `descriptor_heap` | The title asks for 1,245,184 views, more than vkd3d-proton's default cap. |
 | `VICTORY_SKIP_PIPELINES` | 9 shader hashes | `7f05ddab771799a9`, `a53a7977fe762268`, `be14e72d86362031`, `32ed072b9f845048`, `a1b20bc47e3c9597`, `17829ac71aab4e8d`, `e8c962358d862e3f`, `559d9f0184e15fe3`, `afeea48bbb9913ad`. |
 | `VICTORY_L7_SKIP` | `rt,gi,reflections` | With a local role table (`VICTORY_L7_ROLES`): those passes cost time and draw nothing while ray tracing does not run. |
@@ -298,7 +298,7 @@ The script sets the variables below (unless you pass `-NoTunedSettings`, which k
 | `VICTORY_LATE_WAIT` | `3` | Host pipeline wait setting of the fork's pull request #1. |
 | `VICTORY_WIDE_BACK` | `1` | Fork option, on in the measured run. |
 | `VICTORY_RELAY` | not set | Fork option, no longer set by default (fork issue #89: skin disappears, subtitles overlap); `2` was on in the measured runs of `7b0f736` and batch 4. |
-| `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, `1024` | Card buffer sizing, in MB. |
+| `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, from the card | Card buffer sizing, in MB; the second follows the card's budget unless set. |
 | `VICTORY_DSTORAGE_NOTIFY` | `1` | DirectStorage writes into physical pages are reported to the GPU side (fork commits `e49864a` and `bf870de` by Yorivel, fork issue #62): without it the first room's walls can read stale copies and look transparent. |
 | `VICTORY_STAGING_POOL_MB` | `1024` | Staging buffers of the textures picked by index are kept for reuse, up to that many MB, instead of a new upload buffer made and mapped at every upload (`0` keeps none). Measured on an RTX 5080 (driver 621.01, VIctory logs, two runs each way, 25 November): at world entry the stretch below 2.5 fps lasts about 40 s instead of about 80 s, and the texture pass of the first 100 s takes 190 ms a frame instead of 560 to 730 ms; nothing changes once the queue is empty (3.4 to 3.5 fps either way). |
 
