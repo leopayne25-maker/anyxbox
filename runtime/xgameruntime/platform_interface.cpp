@@ -129,8 +129,7 @@ bool UnregisterHintChanged(uint64_t, bool) noexcept { return false; }
 // --- XNetworking : réglages et statistiques des tampons TCP de réception ---------------
 // Ces tampons n'existent que sur console. Microsoft Learn documente la réponse du PC, qui est
 // celle du réseau réel ici : lecture à 0, modification en E_NOTIMPL, statistiques toutes à 0
-// (reference/networking/xnetworking/enums/xnetworkingconfigurationsetting et
-// .../enums/xnetworkingstatisticstype). Un réglage ou un type inconnu donne E_INVALIDARG
+// (pages citées à côté de chaque fonction). Un réglage ou un type inconnu donne E_INVALIDARG
 // (.../functions/xnetworkingqueryconfigurationsetting, xnetworkingquerystatistics).
 constexpr uint32_t kTcpBufferKinds = 3;  // Title, System, Tools
 
@@ -142,6 +141,9 @@ struct TcpQueuedReceiveStatistics {  // XNetworkingTcpQueuedReceivedBufferUsageS
   uint64_t bytes_dropped_for_any_failure;
 };
 
+// The 0 is Microsoft Learn's answer for the PC, for each of the three settings: "Retrieving this setting on PC
+// will always report the value 0." ("this value" for MaxToolsTcpQueuedReceiveBufferSize; XNetworkingConfigurationSetting,
+// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/networking/xnetworking/enums/xnetworkingconfigurationsetting)
 HRESULT XNetworkingQueryConfigurationSetting(uint32_t setting, uint64_t* value) noexcept {
   if (setting >= kTcpBufferKinds || value == nullptr) return E_INVALIDARG;
   *value = 0;
@@ -156,6 +158,9 @@ HRESULT XNetworkingSetConfigurationSetting(uint32_t setting, uint64_t value) noe
 }
 
 // Seule la sous-structure du type demandé est écrite (structs/xnetworkingstatisticsbuffer).
+// All zero is Microsoft Learn's answer for the PC, for each of the three types: "On PC, all statistics in the
+// structure are always reported as 0." (XNetworkingStatisticsType,
+// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/networking/xnetworking/enums/xnetworkingstatisticstype)
 HRESULT XNetworkingQueryStatistics(uint32_t type, TcpQueuedReceiveStatistics* statistics) noexcept {
   if (type >= kTcpBufferKinds || statistics == nullptr) return E_INVALIDARG;
   *statistics = TcpQueuedReceiveStatistics{};
