@@ -291,4 +291,30 @@ mod tests {
             .clone();
         assert!(fallback.env.is_empty());
     }
+
+    #[test]
+    fn vram_presets_enable_levels_on_demand_on_non_nvidia_profiles() {
+        use crate::options::{LaunchOptions, Preset};
+        let dir = game_folder();
+        for profile_id in ["windows-amd", "linux-amd", "intel", "other"] {
+            for (preset, expected_cap) in [(Preset::LowVram, "1024"), (Preset::MidVram, "2048")] {
+                let options = LaunchOptions {
+                    preset,
+                    ..LaunchOptions::default()
+                };
+                let env = build_env(dir.path(), &profile(profile_id), &options.env_pairs(), None)
+                    .expect("env");
+                assert_eq!(
+                    value(&env, "VICTORY_TEXTURE_MAX_SIZE").as_deref(),
+                    Some(expected_cap),
+                    "{profile_id} + {preset:?}"
+                );
+                assert_eq!(
+                    value(&env, "VICTORY_LEVELS_ON_DEMAND").as_deref(),
+                    Some("1"),
+                    "{profile_id} + {preset:?} must enable VICTORY_LEVELS_ON_DEMAND so VIctory honours VICTORY_TEXTURE_MAX_SIZE"
+                );
+            }
+        }
+    }
 }

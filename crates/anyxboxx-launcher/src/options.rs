@@ -46,27 +46,31 @@ const HEIGHT_RANGE: (u32, u32) = (360, 4320);
 /// world (2026-11-26, Series X, 1080p display mode); the list pool is the Quality set's.
 /// `VICTORY_TEXTURE_MAX_SIZE=1024` keeps the levels of the title's textures over 1024 texels off the
 /// card (`victory-gpu` `tiles::max_size`; three quarters of a texture for each level cut), so the
-/// texture queue has room for every texture instead of being refused. It works through the
-/// profile's `VICTORY_LEVELS_ON_DEMAND=1`. The texture staging pool stays at the profile's 512 MB, so
-/// textures arrive as fast as with Fast.
+/// texture queue has room for every texture instead of being refused. Because VIctory only applies
+/// `VICTORY_TEXTURE_MAX_SIZE` when `VICTORY_LEVELS_ON_DEMAND=1` (`resource.rs` / `tiles::wanted`),
+/// the preset sets it explicitly so 8 GB AMD, Intel and Linux hosts honour the cap too. The texture
+/// staging pool stays at the profile's 512 MB, so textures arrive as fast as with Fast.
 pub const LOW_VRAM: &[(&str, &str)] = &[
     ("VICTORY_CARD_WINDOWS_MB", "512"),
     ("VICTORY_CARD_BUFFERS_MB", "512"),
     ("VICTORY_TEXTURE_ROOM_PERCENT", "85"),
     ("VICTORY_LIST_POOL_MOST", "256"),
     ("VICTORY_LIST_POOL_MB", "256"),
+    ("VICTORY_LEVELS_ON_DEMAND", "1"),
     ("VICTORY_TEXTURE_MAX_SIZE", "1024"),
 ];
 
 /// The "12 GB card" preset: Fast's speed with headroom. The profile's reserves (1536 MB of windows
 /// and of buffer copies) were sized on 12 to 16 GB cards and measured on a 16 GB one; here they
 /// are 1024 MB each, and the title's textures are capped at 2048 texels (`VICTORY_TEXTURE_MAX_SIZE`,
-/// one level cut on the 4096 ones only), so the texture queue keeps room on a 12 GB card. Not
-/// measured on a 12 GB card yet.
+/// one level cut on the 4096 ones only, with `VICTORY_LEVELS_ON_DEMAND=1` so non-NVIDIA profiles
+/// honour the cap), so the texture queue keeps room on a 12 GB card. Not measured on a 12 GB card
+/// yet.
 pub const MID_VRAM: &[(&str, &str)] = &[
     ("VICTORY_CARD_WINDOWS_MB", "1024"),
     ("VICTORY_CARD_BUFFERS_MB", "1024"),
     ("VICTORY_TEXTURE_ROOM_PERCENT", "90"),
+    ("VICTORY_LEVELS_ON_DEMAND", "1"),
     ("VICTORY_TEXTURE_MAX_SIZE", "2048"),
 ];
 
