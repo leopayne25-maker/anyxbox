@@ -12,12 +12,17 @@
 
 #![allow(non_snake_case)]
 
+mod accessibility;
 mod dxgi_factory;
 mod entry;
 mod events;
 mod frame_counter;
 mod game_config;
 mod gamer_picture;
+mod gameui;
+mod gameui_input;
+mod gameui_requests;
+mod gameui_responses;
 mod guid;
 mod handle;
 mod hdr;
@@ -37,11 +42,13 @@ mod save_interface;
 mod save_store;
 mod served;
 mod store;
+mod streaming;
 mod system;
 mod system_interface;
 mod tables;
 mod user;
 mod user_async;
+mod user_device;
 
 use std::ffi::{c_char, c_void};
 

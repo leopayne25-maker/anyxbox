@@ -72,6 +72,11 @@ pub unsafe fn local_user_xuid(user: *const c_void) -> Option<u64> {
     unsafe { valid(user) }.then_some(XUID)
 }
 
+/// Whether `local_id` is the XUserLocalId of the profile (C++ `IsLocalUserLocalId`).
+pub fn is_local_user_local_id(local_id: u64) -> bool {
+    local_id == LOCAL_ID
+}
+
 /// Frees a handle made by [`new_handle`].
 pub fn close_handle(user: *mut c_void) {
     if user.is_null() {

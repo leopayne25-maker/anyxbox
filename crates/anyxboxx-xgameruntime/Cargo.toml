@@ -21,16 +21,20 @@ victory-hle.workspace = true
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
 ] }
-# COM: DXGI outputs (HDR state) and Network List Manager (connectivity), as VIctory's windows crate.
+# COM: DXGI outputs (HDR state), Network List Manager (connectivity) and MMDevice (audio endpoints), as VIctory's windows crate.
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_NetworkListManager",
     "Win32_System_Com",
