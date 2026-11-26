@@ -7570,6 +7570,8 @@ impl<'a> Lower<'a> {
                     }
                     if self.exchange.as_ref().is_some_and(|e| e.1) {
                         // a group of 32 or fewer: the lane is in this host wave
+                        let mask = self.s.m.i32(self.wave() - 1);
+                        let lane = self.s.m.bin(self.cur, Bin::And, lane, mask);
                         let r = self.read_lane(a, lane);
                         return int(self, r);
                     }
@@ -7578,6 +7580,8 @@ impl<'a> Lower<'a> {
                         need(self.cur_ir);
                         return Err("a lane read where not every lane runs");
                     }
+                    let k63 = self.s.m.i32(63);
+                    let lane = self.s.m.bin(self.cur, Bin::And, lane, k63);
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
@@ -7593,11 +7597,19 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     return int(self, r);
                 }
+                let lane = if self.mask_data == MaskData::Host {
+                    lane
+                } else {
+                    let mask = self.s.m.i32(self.wave() - 1);
+                    self.s.m.bin(self.cur, Bin::And, lane, mask)
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
+                // On RDNA 2, v_writelane_b32 ignores EXEC and masks the lane index
+                // to the wave size (low 5 bits in wave32, low 6 bits in wave64).
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
@@ -7611,17 +7623,11 @@ impl<'a> Lower<'a> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
-                // (the paired form: a wave64 lane select takes the low six bits)
-                let lane = match self.twin {
-                    Some(_) => {
-                        let k63 = self.s.m.i32(63);
-                        self.s.m.bin(c, Bin::And, lane, k63)
-                    }
-                    None => lane,
-                };
+                let mask = self.s.m.i32(if self.x.native.wave64 { 63 } else { 31 });
+                let lane = self.s.m.bin(c, Bin::And, lane, mask);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                self.write_i(inst, r, None)
             }
             "v_readfirstlane_b32"
                 if inst

@@ -1162,3 +1162,94 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+/// RDNA 2 `v_writelane_b32` ignores EXEC (used for SGPR spills into VGPR lanes inside
+/// divergent branches/guards) and both `v_writelane_b32` and `v_readlane_b32` mask the lane
+/// index to `wave_size - 1` (low 5 bits in wave32, low 6 bits in wave64).
+#[test]
+fn writelane_ignores_exec_and_masks_lane_index_in_wave32_and_paired_wave64() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 1. Wave32 compute: narrow EXEC to even lanes (guarded, no branch), write to odd
+    // (inactive) lane 5 via unmasked index s1 = 37 (37 & 31 == 5), restore EXEC, read back
+    // with v_readlane_b32 at index s1 = 37.
+    let mut w32 = vec![
+        vop1(0x01, 6, v(0)),    // v_mov_b32 v6, v0
+        vop2(0x1B, 3, k(1), 0), // v_and_b32 v3, 1, v0
+        sop1(0x03, 12, EXEC),   // s_mov_b32 s12, exec_lo
+        vopc(0xD2, k(0), 3),    // v_cmpx_eq_u32 exec_lo, 0, v3 (even lanes active)
+    ];
+    w32.extend(vop3(0x361, 6, 0, 1)); // v_writelane_b32 v6, s0, s1
+    w32.push(sop1(0x03, EXEC, 12));   // s_mov_b32 exec_lo, s12
+    w32.extend(vop3(0x360, 14, v(6), 1)); // v_readlane_b32 s14, v6, s1
+    w32.push(vop1(0x01, 7, 14)); // v_mov_b32 v7, s14
+    w32.extend(stores([6, 7, 0, 0]));
+    let native32 = native_of(&w32, false, 32);
+    let p32 = ir::build(&native32.code, native32.wave64, native32.vgprs).expect("ir::build");
+    let shader32 = lowered(&native32, &p32, &HashSet::new()).expect("lower wave32");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader32.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let val32 = 0xDEAD_BEEF;
+    let want32: Vec<u32> = (0..32u32)
+        .flat_map(|t| [if t == 5 { val32 } else { t }, val32, t, t])
+        .collect();
+    let Some(got32) = run_paired(&shader32, [val32, 37, 0, 0], 128) else { return };
+    same_as_console(&got32, &want32);
+
+    // 2. Paired wave64 on a 32-lane host: branch to lanes < 32 (upper lanes 32..63 inactive),
+    // write to inactive lane 45 via unmasked index s1 = 109 (109 & 63 == 45), restore EXEC,
+    // read back via v_readlane_b32 at index s1 = 109.
+    let mut w64 = vec![
+        vop1(0x01, 6, v(0)),  // v_mov_b32 v6, v0
+        vopc(0xC4, k(32), 0), // v_cmp_gt_u32 vcc, 32, v0 (lanes 0..31)
+        sop1(0x24, 12, VCC),  // s_and_saveexec_b64 s[12:13], vcc
+        sopp(0x08, 2),        // s_cbranch_execz past writelane (2 dwords)
+    ];
+    w64.extend(vop3(0x361, 6, 0, 1)); // v_writelane_b32 v6, s0, s1
+    w64.push(sop1(0x04, EXEC, 12));   // s_mov_b64 exec, s[12:13]
+    w64.extend(vop3(0x360, 14, v(6), 1)); // v_readlane_b32 s14, v6, s1
+    w64.push(vop1(0x01, 7, 14)); // v_mov_b32 v7, s14
+    w64.extend(stores([6, 7, 0, 0]));
+    let shader64 = paired(&native_with(&w64, true, 64, 0));
+    let val64 = 0xCAFE_BABE;
+    let want64: Vec<u32> = (0..64u32)
+        .flat_map(|t| [if t == 45 { val64 } else { t }, val64, t, t])
+        .collect();
+    let Some(got64) = run_paired(&shader64, [val64, 109, 0, 0], 256) else { return };
+    same_as_console(&got64, &want64);
+
+    // 3. Split wave64 exchange on a 32-lane host: v_readlane_b32 and v_writelane_b32 with
+    // unmasked indices s0 = 104 (lane 40) and s1 = 69 (lane 5).
+    let mut wex = vop3(0x169, 6, v(0), k(3)).to_vec(); // v_mul_lo_u32 v6, v0, 3
+    wex.push(vop2(0x25, 6, k(1), 6));                  // v_add_nc_u32 v6, 1, v6
+    wex.extend(vop3(0x360, 14, v(6), 0));              // v_readlane_b32 s14, v6, s0 (lane 40)
+    wex.extend(vop3(0x360, 15, v(6), 1));              // v_readlane_b32 s15, v6, s1 (lane 5)
+    wex.extend(vop3(0x361, 6, 2, 0));                  // v_writelane_b32 v6, s2, s0 (lane 40)
+    wex.push(vop1(0x01, 7, 14));                       // v_mov_b32 v7, s14
+    wex.push(vop1(0x01, 8, 15));                       // v_mov_b32 v8, s15
+    wex.extend(stores([6, 7, 8, 0]));
+    let native_ex = native_with(&wex, true, 64, 0);
+    let pex = ir::build(&native_ex.code, native_ex.wave64, native_ex.vgprs).expect("ir::build");
+    let st_ex = structure::structure(&pex).expect("structure");
+    let res_ex = resource::track(&pex, &native_ex.layout, native_ex.stage, Some(&st_ex)).expect("track");
+    let io_ex = io::raise(&pex, &native_ex).expect("io");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader_ex = super::emit(&c, &native_ex, &pex, &st_ex, &io_ex, &res_ex);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader_ex = shader_ex.expect("emit exchange");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader_ex.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let val_ex = 0x1234_5678;
+    let want_ex: Vec<u32> = (0..64u32)
+        .flat_map(|t| [if t == 40 { val_ex } else { 3 * t + 1 }, 3 * 40 + 1, 3 * 5 + 1, t])
+        .collect();
+    let Some(got_ex) = run_paired(&shader_ex, [104, 69, val_ex, 0], 256) else { return };
+    same_as_console(&got_ex, &want_ex);
+    eprintln!("ran on the hardware device: writelane ignored EXEC and readlane/writelane masked lane indices in wave32, paired wave64, and exchange wave64");
+}
