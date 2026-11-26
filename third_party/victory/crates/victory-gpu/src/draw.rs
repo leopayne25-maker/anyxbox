@@ -8,6 +8,9 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+#[cfg(test)]
+mod cut_tables_tests;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -1282,9 +1285,10 @@ impl State {
     /// The pipeline, the root signatures and the heaps are set by the next
     /// draw or dispatch (`bind`, which is told here that the host list has
     /// none); root arguments, vertex and index buffers are set by every
-    /// draw anyway. The dynamic descriptor slots and the tables made in
-    /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
+    /// draw anyway. Dynamic descriptor slots already allocated stay in
+    /// `dynamic` until the title's last part finishes. Build fresh tables and
+    /// an indirect window for the new host list: CBVs and indirect data in the
+    /// earlier list's scratch upload memory may be recycled before this runs.
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
@@ -1293,6 +1297,9 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        self.fresh_tables.clear();
+        self.recording = 0;
+        self.window = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
