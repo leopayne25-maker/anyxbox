@@ -75,8 +75,9 @@ struct Queue {
     /// What is handed out and not done, by resource and first mip, with
     /// the slots that wait for it.
     pending: HashMap<(usize, u32), Vec<u32>>,
-    /// The slots of `pending`: the pass passes over them at once.
-    waiting: HashSet<u32>,
+    /// The slots of `pending` (how many pending jobs name each): the pass
+    /// passes over them at once.
+    waiting: HashMap<u32, u32>,
     /// What is made ready and not taken, by resource.
     ready: HashMap<usize, Vec<Ready>>,
     /// The slots of `ready` (how many entries name each): the pass looks
@@ -92,6 +93,21 @@ struct Queue {
 }
 
 impl Queue {
+    fn wait(&mut self, slot: u32) {
+        *self.waiting.entry(slot).or_insert(0) += 1;
+    }
+
+    fn unwait(&mut self, slots: &[u32]) {
+        for slot in slots {
+            if let Some(n) = self.waiting.get_mut(slot) {
+                *n -= 1;
+                if *n == 0 {
+                    self.waiting.remove(slot);
+                }
+            }
+        }
+    }
+
     fn hint(&mut self, slots: &[u32]) {
         for &slot in slots {
             *self.ready_slots.entry(slot).or_insert(0) += 1;
@@ -144,7 +160,7 @@ pub(crate) enum Slot {
 /// See [`Slot`].
 pub(crate) fn slot(index: u32) -> Slot {
     let q = queue();
-    if q.waiting.contains(&index) {
+    if q.waiting.contains_key(&index) {
         Slot::Waiting
     } else if q.ready_slots.contains_key(&index) {
         Slot::Ready
@@ -197,10 +213,17 @@ pub(crate) fn look(
         return Look::Go;
     }
     if let Some(key) = (0..=first).map(|f| (resource as usize, f)).find(|key| q.pending.contains_key(key)) {
-        if let Some(slots) = q.pending.get_mut(&key) {
-            slots.push(slot);
+        let added = q.pending.get_mut(&key).is_some_and(|slots| {
+            if slots.contains(&slot) {
+                false
+            } else {
+                slots.push(slot);
+                true
+            }
+        });
+        if added {
+            q.wait(slot);
         }
-        q.waiting.insert(slot);
         return Look::Wait;
     }
     if q.frame != frame {
@@ -214,7 +237,7 @@ pub(crate) fn look(
     q.handed += bytes;
     q.outstanding += bytes;
     q.pending.insert((resource as usize, first), vec![slot]);
-    q.waiting.insert(slot);
+    q.wait(slot);
     q.jobs.push_back(Job {
         resource: resource as usize,
         first,
@@ -320,9 +343,7 @@ fn finish(job: Job, outcome: Outcome) {
     let replaced = {
         let mut q = queue();
         let slots = q.pending.remove(&(job.resource, job.first)).unwrap_or_default();
-        for slot in &slots {
-            q.waiting.remove(slot);
-        }
+        q.unwait(&slots);
         match outcome {
             Outcome::NoRoom => {
                 STATS[7].fetch_add(1, Relaxed);
@@ -335,25 +356,30 @@ fn finish(job: Job, outcome: Outcome) {
                 STATS[0].fetch_add(1, Relaxed);
                 STATS[2].fetch_add(bytes, Relaxed);
                 let first = staging.as_ref().map_or(job.first, |s| s.first);
-                q.hint(&slots);
-                let all = q.ready.entry(job.resource).or_default();
-                // One from the same mip already: the new one takes its place,
-                // and the slots that waited for that one (still hinted).
-                let mut old = all.iter().position(|r| r.first == first).map(|i| all.swap_remove(i));
+                // One from the same mip already: retire it before hinting the
+                // deduplicated union so shared slots are neither duplicated in
+                // `Ready.slots` nor double-counted in `ready_slots`.
+                let old = q
+                    .ready
+                    .get_mut(&job.resource)
+                    .and_then(|all| all.iter().position(|r| r.first == first).map(|i| all.swap_remove(i)));
                 let mut slots = slots;
-                if let Some(old) = &mut old {
-                    slots.append(&mut old.slots);
+                if let Some(old) = &old {
+                    q.gone(old);
+                    for &slot in &old.slots {
+                        if !slots.contains(&slot) {
+                            slots.push(slot);
+                        }
+                    }
                 }
-                all.push(Ready {
+                q.hint(&slots);
+                q.ready.entry(job.resource).or_default().push(Ready {
                     staging,
                     first,
                     bytes,
                     at: crate::host::moment(),
                     slots,
                 });
-                if let Some(old) = &old {
-                    q.gone(old);
-                }
                 old
             }
         }
@@ -572,6 +598,8 @@ pub(crate) fn wait_idle(most: std::time::Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// The switch is off unless set: the pass makes its textures itself.
     #[test]
     fn prepare_threads_are_off_unless_set() {
@@ -579,5 +607,194 @@ mod tests {
             assert_eq!(super::threads(), 0);
             assert!(super::take_ready(std::ptr::null(), 0, false).is_none());
         }
+    }
+
+    const DEDUP_CHILD: &str = "VICTORY_PREPARE_DEDUP_CHILD";
+    const DEDUP_TEST: &str = "texture::prepare::tests::replacing_ready_deduplicates_slots_and_releases_staging";
+
+    /// Reproduces two streaming leaks in `texture::prepare`:
+    /// 1. When `finish()` replaces an existing `Ready` entry for `(resource, first)`
+    ///    and shares a waiting slot with it (e.g. a second prepare resolving to the
+    ///    same `staging.first`), appending `old.slots` without deduplicating left the
+    ///    slot twice in `Ready.slots` and `ready_slots[slot] == 2`. Serving the slot
+    ///    only removed one copy, pinning the `Arc<Staging>` upload buffer, keeping
+    ///    `q.outstanding` inflated, and leaving `prepare::slot(slot) == Slot::Ready`
+    ///    for 2+ seconds until `prune()`.
+    /// 2. When a slot waited on two pending jobs (e.g. descriptor slot rewritten
+    ///    while an earlier job was in flight), finishing the first job cleared
+    ///    `q.waiting`, reporting `Slot::Other` while the second job was still pending
+    ///    and allowing `look()` to push a duplicate slot into `q.pending`.
+    #[test]
+    fn replacing_ready_deduplicates_slots_and_releases_staging() {
+        if std::env::var_os(DEDUP_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([DEDUP_TEST, "--exact", "--nocapture", "--test-threads=1"])
+                .env(DEDUP_CHILD, "1")
+                .env("VICTORY_TEXTURE_PREPARE_THREADS", "1")
+                .output()
+                .unwrap();
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "prepare dedup probe failed: {}", output.status);
+            return;
+        }
+        assert_eq!(super::threads(), 1);
+        let Some(_host) = crate::host::host() else {
+            eprintln!("Skipped prepare dedup probe: no D3D12 device");
+            return;
+        };
+        if let Some((name, vram)) = crate::host::adapter_summary() {
+            eprintln!("adapter: {name} ({} MiB VRAM)", vram >> 20);
+        }
+
+        // Create a real 1024x1024 RGBA8 committed title texture (4 MiB) so we
+        // measure real `Arc<Staging>` upload-buffer retention and `STAGED` RAM.
+        const SIDE: u32 = 1024;
+        const RGBA8: u32 = 28;
+        const DESC_WORDS: [u32; 14] = [3, 0, 0, 0, SIDE, 0, SIDE, (1 << 16) | 1, RGBA8, 1, 0, 0x105, 0, 0];
+        const HEAP_WORDS: [u32; 5] = [1, 0, 0, 1, 1];
+        let resource_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        // SAFETY: plain integer structs with matching `#[repr(C)]` layouts.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(DESC_WORDS) };
+        let props: crate::resource::HeapProperties = unsafe { std::mem::transmute(HEAP_WORDS) };
+        let mut res: This = std::ptr::null();
+        let hr = crate::resource::create_committed(
+            std::ptr::null(),
+            &props,
+            0,
+            &desc,
+            0,
+            std::ptr::null(),
+            &resource_iid,
+            &mut res,
+        );
+        assert_eq!(hr, crate::object::S_OK, "create_committed failed");
+        let host_copy = crate::resource::host_copy(res).expect("host texture copy");
+
+        let staged_count_before = super::super::STAGED[0].load(Relaxed);
+        let staged_bytes_before = super::super::STAGED[1].load(Relaxed);
+
+        let staging_a = super::super::prepared_staging(res, &host_copy.texture, 0).expect("staging_a");
+        let staging_b = super::super::prepared_staging(res, &host_copy.texture, 0).expect("staging_b");
+        let stage_bytes = staging_b.bytes;
+        assert!(stage_bytes >= 4 << 20, "expected >= 4 MiB staging buffer, got {stage_bytes}");
+        let weak_b = Arc::downgrade(&staging_b);
+
+        // Scenario 1: Job 1 finishes for slot 10, then Job 2 replaces the same
+        // `(res, first=0)` entry for overlapping slots `[10, 11]`.
+        let key = res as usize;
+        crate::resource::keep_alive(res);
+        {
+            let mut q = queue();
+            q.outstanding += stage_bytes;
+            q.pending.insert((key, 0), vec![10]);
+            q.wait(10);
+        }
+        finish(
+            Job {
+                resource: key,
+                first: 0,
+                bytes: stage_bytes,
+            },
+            Outcome::Done(Some(staging_a)),
+        );
+
+        crate::resource::keep_alive(res);
+        {
+            let mut q = queue();
+            q.outstanding += stage_bytes;
+            q.pending.insert((key, 0), vec![10, 11]);
+            q.wait(10);
+            q.wait(11);
+        }
+        finish(
+            Job {
+                resource: key,
+                first: 0,
+                bytes: stage_bytes,
+            },
+            Outcome::Done(Some(staging_b)),
+        );
+
+        // Serve slot 10 (via `take_ready`) and slot 11 (via `served`).
+        serving(Some(10));
+        let taken = take_ready(res, 0, false).expect("take_ready must return staging_b");
+        serving(None);
+        drop(taken);
+        served(11, res);
+
+        let census_after = census();
+        let slot10_after = slot(10);
+        let slot11_after = slot(11);
+        let weak_strong_after = weak_b.strong_count();
+        let leaked_staged_count = super::super::STAGED[0].load(Relaxed).saturating_sub(staged_count_before);
+        let leaked_staged_bytes = super::super::STAGED[1].load(Relaxed).saturating_sub(staged_bytes_before);
+
+        eprintln!(
+            "prepare_dedup metrics: census={census_after:?} slot10={slot10_after:?} slot11={slot11_after:?} \
+             staging_strong={weak_strong_after} leaked_staged_count={leaked_staged_count} \
+             leaked_staged_bytes={leaked_staged_bytes}"
+        );
+
+        assert_eq!(census_after, [0, 0, 0], "ready entry and outstanding budget must drain after serving all slots");
+        assert_eq!(slot10_after, Slot::Other, "slot 10 must no longer report Slot::Ready after being served");
+        assert_eq!(slot11_after, Slot::Other, "slot 11 must no longer report Slot::Ready after being served");
+        assert_eq!(weak_strong_after, 0, "Arc<Staging> upload buffer must drop immediately when all slots are served");
+        assert_eq!(leaked_staged_count, 0, "STAGED buffer count must return to baseline");
+        assert_eq!(leaked_staged_bytes, 0, "STAGED bytes must return to baseline");
+
+        // Scenario 2: Slot 20 waits on two pending jobs (`res` at mip 1 and mip 0).
+        // Finishing the first job must keep slot 20 in `Slot::Waiting` until the
+        // second job also finishes, and attaching the same slot twice via `look`
+        // must never create duplicate slot entries.
+        crate::resource::keep_alive(res);
+        crate::resource::keep_alive(res);
+        {
+            let mut q = queue();
+            q.outstanding += stage_bytes * 2;
+            q.pending.insert((key, 1), vec![20]);
+            q.pending.insert((key, 0), vec![20]);
+            q.wait(20);
+            q.wait(20);
+        }
+        finish(
+            Job {
+                resource: key,
+                first: 1,
+                bytes: stage_bytes,
+            },
+            Outcome::NoRoom,
+        );
+        assert_eq!(
+            slot(20),
+            Slot::Waiting,
+            "slot 20 is still pending on (res, 0) and must remain Slot::Waiting"
+        );
+        // Re-running `look()` for slot 20 on `(res, 0)` while pending must not duplicate slot 20.
+        let recorded = HashSet::new();
+        assert_eq!(look(20, res, 0, &recorded, 64 << 20, 1), Look::Wait);
+        let staging_c = super::super::prepared_staging(res, &host_copy.texture, 0).expect("staging_c");
+        let weak_c = Arc::downgrade(&staging_c);
+        finish(
+            Job {
+                resource: key,
+                first: 0,
+                bytes: stage_bytes,
+            },
+            Outcome::Done(Some(staging_c)),
+        );
+        served(20, res);
+        assert_eq!(census(), [0, 0, 0], "second scenario must leave queue completely drained");
+        assert_eq!(slot(20), Slot::Other, "slot 20 must return to Slot::Other after served()");
+        assert_eq!(weak_c.strong_count(), 0, "staging_c must drop immediately after slot 20 is served");
+
+        // Release synthetic title texture.
+        super::super::forget(key);
+        crate::resource::let_go_kept(res);
     }
 }
