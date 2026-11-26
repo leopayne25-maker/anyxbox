@@ -1162,3 +1162,102 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+/// A console wave64 compute shader using the full 32 KiB (8,192 dwords) of LDS on a 32-lane
+/// host: `halves` (`wave_base`'s counter) must not push TGSM past D3D12's 32 KiB cap, and
+/// reusing slot 0 must preserve the program's own write to `LDS[0]`.
+#[test]
+fn wave64_full_32kib_lds_without_exchange_fits_on_32_lane_host() {
+    let mut w = vec![
+        vop2(0x1A, 1, k(2), 0),  // v_lshlrev_b32 v1, 2, v0: byte offset 4 * lane
+        vop2(0x26, 2, k(63), 0), // v_sub_nc_u32 v2, 63, v0: mirror lane
+        vop2(0x1A, 2, k(2), 2),  // v_lshlrev_b32 v2, 2, v2: mirror offset
+    ];
+    w.extend(vop3(0x169, 3, v(0), k(3))); // v_mul_lo_u32 v3, v0, 3
+    w.push(vop2(0x25, 3, k(1), 3));       // v_add_nc_u32 v3, 1, v3
+    w.extend(ds(0x0D, 0, 1, 3, 0));       // ds_write_b32 v1, v3 (lane 0 writes LDS[0])
+    w.extend(ds(0x36, 4, 2, 0, 0));       // ds_read_b32 v4, v2 (reads mirror lane across halves)
+    w.extend(stores([4, 3, 0, 0]));
+    let native = native_with(&w, true, 64, 32 * 1024);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let want: Vec<u32> = (0..64u32)
+        .flat_map(|t| [3 * (63 - t) + 1, 3 * t + 1, t, t])
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+    same_as_console(&got, &want);
+    eprintln!("ran on the hardware device: full 32 KiB wave64 LDS shader accepted and exact");
+}
+
+/// A console wave64 compute shader using 32 KiB of LDS and cross-half wave operations
+/// (`v_mbcnt` on a wave64 compare mask) in a 128-thread group on a 32-lane host: the
+/// two-wave `exchange` form would push TGSM past D3D12's 32 KiB cap, so `emit` must fall
+/// back to the paired form (zero exchange LDS, slot 0 reused for `wave_base`).
+#[test]
+fn wave64_full_32kib_lds_with_exchange_falls_back_to_paired_on_32_lane_host() {
+    let mut w = vec![
+        vop2(0x1A, 1, k(2), 0),  // v_lshlrev_b32 v1, 2, v0: byte offset 4 * thread
+        vop2(0x1D, 2, k(32), 0), // v_xor_b32 v2, 32, v0: partner in the other half of the wave
+        vop2(0x1A, 2, k(2), 2),  // v_lshlrev_b32 v2, 2, v2
+    ];
+    w.extend(vop3(0x169, 3, v(0), k(5))); // v_mul_lo_u32 v3, v0, 5
+    w.push(vop2(0x25, 3, k(7), 3));       // v_add_nc_u32 v3, 7, v3
+    w.extend(ds(0x0D, 0, 1, 3, 0));       // ds_write_b32 v1, v3
+    w.extend(ds(0x36, 4, 2, 0, 0));       // ds_read_b32 v4, v2
+    w.extend([
+        vopc(0xC1, LIT, 4), // v_cmp_lt_u32 vcc, 100, v4 (lanes with v4 > 100)
+        100,
+        sop1(0x10, 16, VCC), // s_bcnt1_i32_b64 s16, vcc
+    ]);
+    w.extend(vop3(0x365, 5, VCC, k(0)));       // v_mbcnt_lo_u32_b32 v5, vcc_lo, 0
+    w.extend(vop3(0x366, 5, VCC + 1, v(5)));   // v_mbcnt_hi_u32_b32 v5, vcc_hi, v5
+    w.push(vop1(0x01, 6, 16));                 // v_mov_b32 v6, s16
+    w.extend(stores([4, 6, 5, 0]));
+    let native = native_with(&w, true, 128, 32 * 1024);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    let pair = super::paired(&c, &native, &p, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit");
+    let (pair, _) = pair.expect("paired");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    assert!(shader.dxil == pair.dxil, "expected fallback to paired form when exchange overflows 32 KiB LDS");
+    let want: Vec<u32> = (0..128u32)
+        .flat_map(|t| {
+            let base = t & !63;
+            let lane = t & 63;
+            let val = |n: u32| 5 * (n ^ 32) + 7;
+            let mask = (0..64u32)
+                .filter(|&l| val(base + l) > 100)
+                .fold(0u64, |m, l| m | 1u64 << l);
+            let below = (mask & ((1u64 << lane) - 1)).count_ones();
+            [val(t), mask.count_ones(), below, t]
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 512) else { return };
+    same_as_console(&got, &want);
+    eprintln!("ran on the hardware device: 32 KiB wave64 LDS + cross-half ops fell back to paired and matched");
+}
