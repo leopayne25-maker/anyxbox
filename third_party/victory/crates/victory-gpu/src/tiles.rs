@@ -552,20 +552,25 @@ impl Tiled {
             // SAFETY: a live reserved texture and a live heap of ours; one
             // region of `tiles` tiles from the subresource's first tile;
             // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
-            unsafe {
-                queue.UpdateTileMappings(
-                    texture,
-                    1,
-                    Some(&raw const at),
-                    Some(&raw const size),
-                    &heap,
-                    runs.len() as u32,
-                    Some(flags.as_ptr()),
-                    Some(starts.as_ptr()),
-                    Some(counts.as_ptr()),
-                    D3D12_TILE_MAPPING_FLAG_NONE,
-                );
+            // arrays of that length that live through the call. `queue_lock`
+            // serializes `UpdateTileMappings` against concurrent `Host::queue`
+            // submissions from card-demotion readbacks.
+            {
+                let _q = crate::host::queue_lock();
+                unsafe {
+                    queue.UpdateTileMappings(
+                        texture,
+                        1,
+                        Some(&raw const at),
+                        Some(&raw const size),
+                        &heap,
+                        runs.len() as u32,
+                        Some(flags.as_ptr()),
+                        Some(starts.as_ptr()),
+                        Some(counts.as_ptr()),
+                        D3D12_TILE_MAPPING_FLAG_NONE,
+                    );
+                }
             }
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
