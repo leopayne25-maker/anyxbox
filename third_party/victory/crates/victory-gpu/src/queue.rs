@@ -2,6 +2,8 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
@@ -40,7 +42,7 @@ struct Queue {
     /// What the queue was given after a wait for a fence that had not been
     /// reached, in order; it runs when the fence gets there.
     #[cfg(windows)]
-    held: std::sync::Mutex<Vec<Held>>,
+    held: std::sync::Mutex<VecDeque<Held>>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -61,6 +63,36 @@ enum Held {
 /// The queues that hold something (their addresses).
 #[cfg(windows)]
 static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Records `q` in [`WAITING`] if it is not already present.
+#[cfg(windows)]
+fn mark_waiting(q: usize) {
+    let mut waiting = lock(&WAITING);
+    if !waiting.contains(&q) {
+        waiting.push(q);
+    }
+}
+
+/// Runs the host command lists for `lists`, avoiding heap allocation when a
+/// single list is submitted. Always invokes `host.execute` (even with `&[]`)
+/// to preserve empty-submission side effects.
+#[cfg(windows)]
+fn execute_host_lists(host: &crate::host::Host, lists: &[This]) {
+    if let &[only] = lists {
+        match crate::list::host_list(only) {
+            Some(h) => host.execute(&[h]),
+            None => host.execute(&[]),
+        }
+        return;
+    }
+    let mut now = Vec::with_capacity(lists.len());
+    for &l in lists {
+        if let Some(h) = crate::list::host_list(l) {
+            now.push(h);
+        }
+    }
+    host.execute(&now);
+}
 
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -164,11 +196,7 @@ fn submit_cut(this: This, lists: &[This]) {
         let (taken, order) = crate::list::detach(&lists[..first]);
         host.execute_late(taken, order);
     } else if first > 0 {
-        let now: Vec<_> = lists[..first]
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&now);
+        execute_host_lists(host, &lists[..first]);
         // They have run: their descriptor tables' slots are free again, as
         // on the path without cuts ([`execute`]). This path replaced that
         // one without the call, so the lists that run at once kept their
@@ -178,6 +206,7 @@ fn submit_cut(this: This, lists: &[This]) {
     }
     if first < lists.len() {
         let parts = crate::list::detach_parts(&lists[first..]);
+        let wait_count: usize = parts.iter().map(|p| p.0.len()).sum();
         static SEEN: AtomicU64 = AtomicU64::new(0);
         if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
             tracing::info!(
@@ -185,21 +214,19 @@ fn submit_cut(this: This, lists: &[This]) {
                 lists = lists.len(),
                 run_at_once = first,
                 parts = parts.len(),
-                waits = parts.iter().map(|p| p.0.len()).sum::<usize>(),
+                waits = wait_count,
                 "a submission is given to its queue part by part (its lists wait for memory values)"
             );
         }
         {
             let mut held = lock(&queue(this).held);
+            held.reserve(wait_count + parts.len());
             for (waits, taken, order) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
-                held.push(Held::Run(taken, order));
+                held.push_back(Held::Run(taken, order));
             }
         }
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        mark_waiting(this as usize);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -239,11 +266,7 @@ fn submit_split(this: This, lists: &[This]) {
         )
     });
     if cut > 0 {
-        let now: Vec<_> = lists[..cut]
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&now);
+        execute_host_lists(host, &lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -259,7 +282,8 @@ fn submit_split(this: This, lists: &[This]) {
         let rest = &lists[cut..];
         // A list's host side can be taken once.
         let twice = rest.iter().enumerate().any(|(i, l)| rest[..i].contains(l));
-        let mut pieces: Vec<Held> = Vec::new();
+        let wait_count: usize = by[cut..].iter().map(Vec::len).sum();
+        let mut pieces: Vec<Held> = Vec::with_capacity(wait_count + rest.len());
         let mut from = cut;
         while from < lists.len() {
             // Up to the next list that waits for anything (met or not: it
@@ -271,17 +295,17 @@ fn submit_split(this: This, lists: &[This]) {
                     .find(|&i| !by[i].is_empty())
                     .unwrap_or(lists.len())
             };
-            let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
-            pieces.extend(waits.into_iter().map(Held::Value));
+            pieces.extend(
+                by[from..to]
+                    .iter()
+                    .flat_map(|ws| ws.iter().cloned().map(Held::Value)),
+            );
             let (taken, order) = crate::list::detach(&lists[from..to]);
             pieces.push(Held::Run(taken, order));
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        mark_waiting(this as usize);
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -299,7 +323,7 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     if held.is_empty() {
         return false;
     }
-    held.push(what());
+    held.push_back(what());
     true
 }
 
@@ -322,15 +346,20 @@ pub(crate) fn release_held(all: bool) {
     }
     let _looking = crate::timeline::span("looking at what queues hold");
     let _one = lock(&RELEASING);
+    let mut queues = Vec::new();
     loop {
-        let queues = lock(&WAITING).clone();
+        {
+            let waiting = lock(&WAITING);
+            queues.clear();
+            queues.extend_from_slice(&waiting);
+        }
         let mut moved = false;
-        for q in queues {
+        for &q in &queues {
             // SAFETY: a live queue: one released is taken off the list.
             let held = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(held);
             loop {
-                match held.first() {
+                match held.front() {
                     None => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
@@ -340,7 +369,10 @@ pub(crate) fn release_held(all: bool) {
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
                     Some(_) => {}
                 }
-                match held.remove(0) {
+                let Some(item) = held.pop_front() else {
+                    break;
+                };
+                match item {
                     Held::Wait(..) => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
@@ -373,7 +405,10 @@ pub(crate) fn release_held(all: bool) {
                             let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
                             if waits > 0
                                 && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                && held
+                                    .iter()
+                                    .take(waits)
+                                    .all(|h| matches!(h, Held::Value(w) if w.met()))
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
@@ -385,16 +420,18 @@ pub(crate) fn release_held(all: bool) {
                             // until they are settled.
                             host.execute_late(lists, order);
                         } else {
-                            let ran = {
-                                let runs: Vec<&crate::host::HostList> =
-                                    order.iter().map(|&i| lists[i].host()).collect();
-                                match crate::host::host() {
-                                    Some(host) => {
+                            let ran = match crate::host::host() {
+                                Some(host) => {
+                                    if let &[only] = order.as_slice() {
+                                        host.execute(&[lists[only].host()]);
+                                    } else {
+                                        let runs: Vec<&crate::host::HostList> =
+                                            order.iter().map(|&i| lists[i].host()).collect();
                                         host.execute(&runs);
-                                        true
                                     }
-                                    None => false,
+                                    true
                                 }
+                                None => false,
                             };
                             // They have run: their host lists are used again.
                             if ran {
@@ -598,10 +635,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
+                mark_waiting(this as usize);
             }
         }
         let kept = hold(this, || {
@@ -626,11 +660,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         if kept {
             return;
         }
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&host_lists);
+        execute_host_lists(host, lists);
         crate::list::tables_done(lists);
         // What the lists wrote at the bottom of the pipe may be a fence
         // another queue waits for.
@@ -781,7 +811,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push_back(Held::Wait(fence as usize, value));
             }
             behind
         };
@@ -798,12 +828,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            {
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
+            mark_waiting(this as usize);
             // The fence may have got there meanwhile.
             release_held(false);
         }
@@ -1383,5 +1408,42 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_signals_release_in_fifo_order_after_wait() {
+        if behind::on() {
+            return;
+        }
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let mut gate = null;
+        let mut out = null;
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut gate), S_OK);
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut out), S_OK);
+
+        // Queue waits on `gate >= 1`, then queues two ordered signals on `out`.
+        assert_eq!(wait(q, gate, 1), S_OK);
+        assert_eq!(signal(q, out, 10), S_OK);
+        assert_eq!(signal(q, out, 20), S_OK);
+        assert_eq!(crate::fence::completed(out), 0);
+
+        // Signaling `gate` releases the queued FIFO signals in order.
+        assert_eq!(crate::fence::signal(gate, 1), S_OK);
+        assert_eq!(crate::fence::completed(out), 20);
+        assert!(lock(&queue(q).held).is_empty());
+
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(gate, 0x10)(gate), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(out, 0x10)(out), 0);
     }
 }
