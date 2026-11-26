@@ -141,9 +141,25 @@ fn build() -> [u8; 32] {
         }
         bytes
     });
+    let settings = victory_shader::emit::host_settings();
+    static LAST: std::sync::Mutex<Option<([u32; 5], [u8; 32])>> = std::sync::Mutex::new(None);
+    {
+        let last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(cached_settings, cached_key)) = last.as_ref()
+            && cached_settings == settings
+        {
+            return cached_key;
+        }
+    }
+    let key = build_for(fixed, &settings);
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((settings, key));
+    key
+}
+
+fn build_for(fixed: &[u8], settings: &[u32; 5]) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(fixed);
-    for value in victory_shader::emit::host_settings() {
+    for value in settings {
         hash.update(&value.to_le_bytes());
     }
     *hash.finalize().as_bytes()
@@ -181,12 +197,13 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. Keeps the freshly translated `HostShader` so a
+/// miss does not re-read and re-decode the file it just wrote.
 struct Translate<'a, F> {
     translate: F,
     /// The build of the translator, written into the entry.
     source: &'a str,
-    ran: AtomicBool,
+    produced: std::sync::Mutex<Option<HostShader>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<'_, F> {
@@ -198,9 +215,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader, self.source))
+        let encoded = encode(&shader, self.source);
+        *self.produced.lock().unwrap_or_else(|e| e.into_inner()) = Some(shader);
+        Ok(encoded)
     }
 }
 
@@ -225,20 +243,32 @@ fn cached_by(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    let mut input = Vec::with_capacity(build.len() + container.len());
+    input.extend_from_slice(build);
+    input.extend_from_slice(container);
     let converter = Translate {
         translate,
         source,
-        ran: AtomicBool::new(false),
+        produced: std::sync::Mutex::new(None),
     };
     let mut old: Option<HostShader> = None;
     for _ in 0..3 {
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
+        if let Some(shader) = converter.produced.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if let Some(old) = old.take() {
+                REFRESHED.fetch_add(1, Ordering::Relaxed);
+                if old != shader {
+                    CHANGED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader translated and cached");
+            return Ok(shader);
+        }
         if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let ran = converter.ran.load(Ordering::Relaxed);
-            if !ran && made_by != source.as_bytes() {
+            if made_by != source.as_bytes() {
                 STALE.fetch_add(1, Ordering::Relaxed);
                 if refresh && old.is_none() {
                     // Translated again in its place; what came out before
@@ -259,13 +289,8 @@ fn cached_by(
                     CHANGED.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            let (counter, what) = if ran {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            HITS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader from the cache");
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
@@ -314,7 +339,28 @@ fn root_type(code: u32) -> RootType {
 /// Little-endian words and length-prefixed lists, after the build of the
 /// translator that made the entry (`source`, length-prefixed).
 fn encode(s: &HostShader, source: &str) -> Vec<u8> {
-    let mut out = MAGIC.to_vec();
+    let exact = 4
+        + 4
+        + source.len()
+        + 4
+        + 4
+        + s.dxil.len()
+        + 4
+        + s.user_data.len() * 16
+        + 4
+        + s.samplers.len() * 16
+        + 4
+        + s.static_samplers.len() * 40
+        + 4
+        + s.root_cbvs.len()
+        + 4
+        + s.root_srvs.len()
+        + 4
+        + s.root_uavs.len()
+        + 4
+        + s.root_indexed_views.len() * 20;
+    let mut out = Vec::with_capacity(exact);
+    out.extend_from_slice(MAGIC);
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     word(&mut out, source.len() as u32);
     out.extend(source.as_bytes());
@@ -537,6 +583,7 @@ mod tests {
     #[test]
     fn entries_round_trip_and_reject_damage() {
         let bytes = encode(&shader(), "made by");
+        assert_eq!(bytes.len(), bytes.capacity());
         assert_eq!(decode(&bytes), Some((shader(), b"made by".to_vec())));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
@@ -545,6 +592,20 @@ mod tests {
         let mut v1 = bytes.clone();
         v1[3] = b'1';
         assert_eq!(decode(&v1), None);
+    }
+
+    #[test]
+    fn build_key_tracks_host_settings_and_matches_direct_hash() {
+        let fixed = b"fixed build prefix";
+        let a: [u32; 5] = [1, 2, 3, 4, 5];
+        let b: [u32; 5] = [1, 2, 3, 4, 6];
+        let mut h = blake3::Hasher::new();
+        h.update(fixed);
+        for v in a {
+            h.update(&v.to_le_bytes());
+        }
+        assert_eq!(build_for(fixed, &a), *h.finalize().as_bytes());
+        assert_ne!(build_for(fixed, &a), build_for(fixed, &b));
     }
 
     /// An entry an earlier build of the translator made, under the same
