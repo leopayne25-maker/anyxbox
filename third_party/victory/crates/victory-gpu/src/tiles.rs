@@ -49,6 +49,7 @@
 //! every other texture is made as before. Off unless
 //! `VICTORY_LEVELS_ON_DEMAND=1`.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -129,13 +130,81 @@ pub(crate) fn given_total() -> u64 {
     STATS[2].load(Ordering::Relaxed)
 }
 
+/// Free runs of tiles `(first tile, tiles)` in ascending order with no two
+/// touching, plus a cached total free-tile count.
+struct FreeRuns {
+    runs: VecDeque<(u32, u32)>,
+    tiles: u32,
+}
+
+impl FreeRuns {
+    fn full(total: u32) -> Self {
+        let mut runs = VecDeque::with_capacity(1);
+        if total > 0 {
+            runs.push_back((0, total));
+        }
+        Self { runs, tiles: total }
+    }
+
+    fn free_tiles(&self) -> u32 {
+        self.tiles
+    }
+
+    fn take(&mut self, count: u32) -> Option<Vec<(u32, u32)>> {
+        if count == 0 || count > self.tiles {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut left = count;
+        while left > 0 {
+            let front = self.runs.front_mut()?;
+            let (start, tiles) = *front;
+            let part = tiles.min(left);
+            out.push((start, part));
+            if part == tiles {
+                self.runs.pop_front();
+            } else {
+                *front = (start + part, tiles - part);
+            }
+            left -= part;
+        }
+        self.tiles -= count;
+        Some(out)
+    }
+
+    fn give_back(&mut self, returned: &[(u32, u32)]) {
+        let mut added = 0u32;
+        for &(from, tiles) in returned {
+            if tiles > 0 {
+                self.runs.push_back((from, tiles));
+                added += tiles;
+            }
+        }
+        if added == 0 {
+            return;
+        }
+        self.tiles += added;
+        let slice = self.runs.make_contiguous();
+        slice.sort_unstable();
+        let mut write = 0;
+        for read in 0..slice.len() {
+            let (from, tiles) = slice[read];
+            if write > 0 && slice[write - 1].0 + slice[write - 1].1 == from {
+                slice[write - 1].1 += tiles;
+            } else {
+                slice[write] = (from, tiles);
+                write += 1;
+            }
+        }
+        self.runs.truncate(write);
+    }
+}
+
 /// One heap of the pool and its free runs of tiles (first tile, tiles), in
 /// order, no two touching.
 struct Heap {
     heap: ID3D12Heap,
-    free: Vec<(u32, u32)>,
-    /// Sum of the free runs, maintained under the pool's lock.
-    free_tiles: u32,
+    free: FreeRuns,
 }
 
 // SAFETY: a heap of the device, named only in queue and device calls, which
@@ -160,7 +229,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     let mut best_free = HEAP_TILES + 1;
     for (index, heap) in pool.iter().enumerate() {
         let Some(heap) = heap else { continue };
-        let free = heap.free_tiles;
+        let free = heap.free.free_tiles();
         if free < count || free >= best_free {
             continue;
         }
@@ -190,8 +259,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             }
             let fresh = Heap {
                 heap: made?,
-                free: vec![(0, HEAP_TILES)],
-                free_tiles: HEAP_TILES,
+                free: FreeRuns::full(HEAP_TILES),
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
@@ -207,20 +275,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         }
     };
     let h = pool[index].as_mut()?;
-    let mut runs = Vec::new();
-    let mut left = count;
-    while left > 0 {
-        let &(start, tiles) = h.free.first()?;
-        let part = tiles.min(left);
-        runs.push((start, part));
-        if part == tiles {
-            h.free.remove(0);
-        } else {
-            h.free[0] = (start + part, tiles - part);
-        }
-        left -= part;
-    }
-    h.free_tiles -= count;
+    let runs = h.free.take(count)?;
     Some((h.heap.clone(), index, runs))
 }
 
@@ -234,18 +289,8 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
     let Some(Some(h)) = pool.get_mut(index) else {
         return;
     };
-    h.free.extend_from_slice(runs);
-    h.free.sort_unstable();
-    let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
-    for &(from, tiles) in &h.free {
-        match joined.last_mut() {
-            Some(last) if last.0 + last.1 == from => last.1 += tiles,
-            _ => joined.push((from, tiles)),
-        }
-    }
-    h.free = joined;
-    h.free_tiles = h.free.iter().map(|run| run.1).sum();
-    if h.free_tiles == HEAP_TILES && pool.iter().flatten().count() > 1 {
+    h.free.give_back(runs);
+    if h.free.free_tiles() == HEAP_TILES && pool.iter().flatten().count() > 1 {
         pool[index] = None;
         STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
         STATS[8].fetch_add(1, Ordering::Relaxed);
@@ -1598,5 +1643,43 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn free_runs_tracks_count_and_coalesces_in_place() {
+        let mut free = FreeRuns::full(16);
+        assert_eq!(free.free_tiles(), 16);
+        assert_eq!(free.take(0), None);
+        assert_eq!(free.take(17), None);
+
+        let a = free.take(4).unwrap();
+        let b = free.take(4).unwrap();
+        let c = free.take(4).unwrap();
+        let d = free.take(4).unwrap();
+        assert_eq!(a, [(0, 4)]);
+        assert_eq!(b, [(4, 4)]);
+        assert_eq!(c, [(8, 4)]);
+        assert_eq!(d, [(12, 4)]);
+        assert_eq!(free.free_tiles(), 0);
+        assert_eq!(free.take(1), None);
+
+        // Return non-adjacent runs out of order: stays fragmented until bridged.
+        free.give_back(&c);
+        free.give_back(&a);
+        assert_eq!(free.free_tiles(), 8);
+        assert_eq!(free.runs.iter().copied().collect::<Vec<_>>(), [(0, 4), (8, 4)]);
+
+        // Taking across two fragmented runs pops the first run in O(1) and trims the second.
+        let split = free.take(6).unwrap();
+        assert_eq!(split, [(0, 4), (8, 2)]);
+        assert_eq!(free.free_tiles(), 2);
+        assert_eq!(free.runs.iter().copied().collect::<Vec<_>>(), [(10, 2)]);
+
+        // Returning everything coalesces back to a single full run.
+        free.give_back(&d);
+        free.give_back(&split);
+        free.give_back(&b);
+        assert_eq!(free.free_tiles(), 16);
+        assert_eq!(free.runs.iter().copied().collect::<Vec<_>>(), [(0, 16)]);
     }
 }
