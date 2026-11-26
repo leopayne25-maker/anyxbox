@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
@@ -150,11 +150,27 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File {
+            files,
+            key: AtomicUsize::new(0),
+        },
+    );
+    let key = file as usize;
+    // SAFETY: `Instance::create` just allocated `Instance<File>`.
+    unsafe { &*file.cast::<Instance<File>>() }
+        .state
+        .key
+        .store(key, Ordering::Relaxed);
     if stream_log::on() {
-        stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
+        stream_log::line(format_args!("F\t{:x}\t{kept}", key));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    {
+        let mut files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        files.retain(|(k, _)| *k != key);
+        files.push((key, kept));
+    }
     put(out, file)
 }
 
@@ -277,6 +293,20 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// Address of the owning `Instance<File>` registered in [`WALLS_FILES`].
+    key: AtomicUsize,
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        let key = self.key.load(Ordering::Relaxed);
+        if key != 0 {
+            WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(k, _)| *k != key);
+        }
+    }
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -2550,5 +2580,29 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn releasing_a_file_removes_it_from_walls_files() {
+        let (_dir, file) = file_with(&pattern(32));
+        let key = file as usize;
+        assert!(
+            WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(k, _)| *k == key),
+            "opened file should be registered in WALLS_FILES"
+        );
+        let release_fn: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(release_fn(file), 0);
+        assert!(
+            !WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(k, _)| *k == key),
+            "released file should be removed from WALLS_FILES"
+        );
     }
 }
