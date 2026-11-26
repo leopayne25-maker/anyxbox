@@ -226,10 +226,14 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and when it was returned (`host::now_ms`).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64, u64);
+struct Idle {
+    host: crate::host::HostList,
+    scratch_bytes: u64,
+    recycled_ms: u64,
+}
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -306,13 +310,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes, _)) = &taken {
-            idle.1 -= bytes;
+        if let Some(Idle { scratch_bytes, .. }) = &taken {
+            idle.1 -= scratch_bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _, _)) => Some(list),
+        Some(Idle { host, .. }) => Some(host),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -340,19 +344,76 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < idle_most().0 && idle.1 + bytes <= idle_most().1 {
             let now = crate::host::now_ms();
-            idle.0.push(Idle(host, bytes, now));
+            idle.0.push(Idle { host, scratch_bytes: bytes, recycled_ms: now });
             idle.1 += bytes;
             // `VICTORY_LIST_POOL_IDLE_S`: lists the frames did not need for that long are destroyed.
             if let Some(secs) = idle_trim() {
-                let n = stale(idle.0.iter().map(|i| i.2), now, secs * 1000);
+                let n = stale(idle.0.iter().map(|i| i.recycled_ms), now, secs * 1000);
                 let gone: Vec<Idle> = idle.0.drain(..n).collect();
-                idle.1 -= gone.iter().map(|i| i.1).sum::<u64>();
+                let freed_bytes: u64 = gone.iter().map(|i| i.scratch_bytes).sum();
+                idle.1 = idle.1.saturating_sub(freed_bytes);
                 TRIMMED_LISTS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 drop(idle);
                 drop(gone);
+                if n > 0 {
+                    crate::ram_trim::note_lists_trimmed(n as u64);
+                }
+                crate::ram_trim::note_pool_trimmed(freed_bytes);
             }
         }
     }
+}
+
+/// Releases cold idle host lists (and excess spare indirect/ahead COM buffers on
+/// remaining idle lists) above the host's [`TrimPolicy`](crate::ram_trim::TrimPolicy)
+/// warm working set. Called from `host::sweep` when no GPU flights are active.
+#[cfg(windows)]
+pub(crate) fn let_go_idle_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let warm_keep = if policy.panic_memory {
+        0
+    } else {
+        policy.list_idle_warm_count
+    };
+    let max_age = idle_trim().map_or(policy.list_idle_ms, |secs| {
+        policy.list_idle_ms.min(secs.saturating_mul(1000))
+    });
+    let mut dropped: Vec<Idle> = Vec::new();
+    let mut trimmed_coms = crate::host::TrimmedListCaches::default();
+    let mut trimmed_scratch = 0u64;
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let (list, bytes) = &mut *idle;
+        // `fresh_list` pops from the back (LIFO), so the front holds the oldest
+        // unused lists in order of `recycled_ms`.
+        let mut drain_n = 0usize;
+        while list.len() - drain_n > warm_keep {
+            let age = now.saturating_sub(list[drain_n].recycled_ms);
+            if age < max_age && !policy.panic_memory {
+                break;
+            }
+            drain_n += 1;
+        }
+        if drain_n > 0 {
+            for item in list.drain(..drain_n) {
+                *bytes = bytes.saturating_sub(item.scratch_bytes);
+                trimmed_scratch += item.scratch_bytes;
+                dropped.push(item);
+            }
+        }
+        for entry in list.iter() {
+            if now.saturating_sub(entry.recycled_ms) >= policy.pool_idle_ms || policy.low_memory {
+                trimmed_scratch += entry.host.take_idle_caches(&mut trimmed_coms);
+            }
+        }
+    }
+    let count = dropped.len() as u64;
+    drop(trimmed_coms);
+    drop(dropped);
+    if count > 0 {
+        TRIMMED_LISTS.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        crate::ram_trim::note_lists_trimmed(count);
+    }
+    crate::ram_trim::note_pool_trimmed(trimmed_scratch);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -2396,5 +2457,69 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn idle_trim_releases_only_aged_lists_past_warm_count() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut lists = Vec::new();
+        for _ in 0..4 {
+            let Ok(hl) = host.new_list() else {
+                return;
+            };
+            hl.close();
+            lists.push(hl);
+        }
+        let base_now = crate::host::now_ms().max(100_000);
+        {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            idle.0.clear();
+            idle.1 = 0;
+            for (i, hl) in lists.into_iter().enumerate() {
+                let ts = if i < 2 { base_now } else { base_now + 20_000 };
+                idle.0.push(Idle {
+                    host: hl,
+                    scratch_bytes: 0,
+                    recycled_ms: ts,
+                });
+            }
+        }
+        let trimmed_before = crate::ram_trim::COUNTERS
+            .list_trimmed_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let policy = crate::ram_trim::TrimPolicy {
+            aggressive: false,
+            tier: crate::ram_trim::HostTier::Standard32,
+            low_memory: false,
+            panic_memory: false,
+            pool_idle_ms: 10_000,
+            shadow_pool_warm_bytes: 0,
+            shadow_pool_reserve_slots: 0,
+            scratch_spare_warm_bytes: 0,
+            texture_spare_warm_bytes: 0,
+            list_idle_warm_count: 2,
+            list_idle_ms: 10_000,
+            shader_dxil_idle_ms: 0,
+            shader_container_idle_ms: 0,
+            decommit_cold_reference_ms: None,
+            fetched_warm_bytes: 0,
+        };
+        let_go_idle_with(&policy, base_now + 21_000);
+        {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(idle.0.len(), 2);
+            assert!(idle.0.iter().all(|e| e.recycled_ms == base_now + 20_000));
+            idle.0.clear();
+            idle.1 = 0;
+        }
+        assert!(
+            crate::ram_trim::COUNTERS
+                .list_trimmed_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= trimmed_before + 2
+        );
     }
 }

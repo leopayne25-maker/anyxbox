@@ -339,18 +339,14 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
-        let made = Self::create(shaders, g);
-        if made.is_some() {
-            // `VICTORY_DROP_DXIL=1`: the code was read to make the pipeline and is not needed again.
-            shaders.iter().for_each(|s| s.release_dxil());
-        }
-        made
+        Self::create(shaders, g)
     }
 
     fn create(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
+        let _dxil_pins: Vec<_> = shaders.iter().map(|s| s.pin_dxil()).collect();
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -520,7 +516,7 @@ impl HostPipeline {
             }
         };
         // Held until the pipeline is made: the descriptions point into them.
-        let dxils: Vec<Arc<Vec<u8>>> = stages.iter().map(|(s, _)| s.dxil()).collect::<Option<_>>()?;
+        let dxils: Vec<Arc<[u8]>> = stages.iter().map(|(s, _)| s.dxil()).collect::<Option<_>>()?;
         let code = |i: usize| {
             dxils.get(i).map_or(D3D12_SHADER_BYTECODE::default(), |d| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: d.as_ptr().cast(),
