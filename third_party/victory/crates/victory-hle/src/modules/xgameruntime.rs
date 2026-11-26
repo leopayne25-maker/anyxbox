@@ -73,6 +73,8 @@ pub struct Object {
     vtable: *const *const (),
     /// Named in the log when a title calls a method we lack.
     area: &'static str,
+    /// Slots in the table before its guard.
+    methods: usize,
 }
 
 // SAFETY: the table is a static array of function addresses.
@@ -81,18 +83,89 @@ unsafe impl Sync for Object {}
 impl Object {
     pub const fn new<const N: usize>(area: &'static str, methods: &'static Methods<N>) -> Object {
         Object {
-            vtable: methods.0.as_ptr(),
+            // From the whole table, so the guard after the slots is in reach.
+            vtable: (methods as *const Methods<N>).cast(),
             area,
+            methods: N,
         }
     }
 }
 
+/// Slots of `past_end` stubs after every method table. The runtime's
+/// interfaces are not public, so their real method counts are unknown; a
+/// title built against a newer runtime may call methods past the ones we
+/// list.
+pub const PAST_END_SLOTS: usize = 64;
+
 /// An object's method table, by slot (`QueryInterface`, `AddRef`,
-/// `Release`, then the area's methods from offset 0x18).
-pub struct Methods<const N: usize>(pub [*const (); N]);
+/// `Release`, then the area's methods from offset 0x18), followed by
+/// `PAST_END_SLOTS` stubs so that a call past the last known slot fails
+/// with `E_NOTIMPL` instead of jumping through whatever follows the table.
+#[repr(C)]
+pub struct Methods<const N: usize> {
+    slots: [*const (); N],
+    past_end: [*const (); PAST_END_SLOTS],
+}
 
 // SAFETY: function addresses only.
 unsafe impl<const N: usize> Sync for Methods<N> {}
+
+impl<const N: usize> Methods<N> {
+    pub const fn new(slots: [*const (); N]) -> Methods<N> {
+        assert!(
+            N + PAST_END_SLOTS <= PAST_END.len() * 10,
+            "PAST_END too short"
+        );
+        let mut past_end = [std::ptr::null(); PAST_END_SLOTS];
+        let mut i = 0;
+        while i < PAST_END_SLOTS {
+            let slot = N + i;
+            past_end[i] = PAST_END[slot / 10][slot % 10];
+            i += 1;
+        }
+        Methods { slots, past_end }
+    }
+}
+
+/// `past_end::<SLOT>` for every slot index, in rows of ten.
+macro_rules! past_end_rows {
+    ($($row:literal)*) => { [$(past_end_rows!(@row $row),)*] };
+    (@row $r:literal) => {
+        past_end_rows!(@slots $r; 0 1 2 3 4 5 6 7 8 9)
+    };
+    (@slots $r:literal; $($c:literal)*) => {
+        [$(past_end::<{ $r * 10 + $c }> as *const (),)*]
+    };
+}
+
+const PAST_END: [[*const (); 10]; 16] = past_end_rows!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
+
+/// A slot past the end of an object's known methods. Takes no arguments,
+/// so any argument list is safe to pass (the x64 caller cleans up).
+/// Logged once per area and slot, as such a call would repeat each frame.
+extern "system" fn past_end<const SLOT: usize>(this: *const Object) -> HRESULT {
+    // SAFETY: title code calls methods on objects we handed out.
+    let area = unsafe { (*this).area };
+    if first_call_past_end(area, SLOT) {
+        tracing::warn!(
+            area,
+            slot = format_args!("{:#x}", SLOT * 8),
+            "runtime method not implemented (past the end of its table)"
+        );
+    }
+    xasync::E_NOTIMPL
+}
+
+/// Whether this is the first call to `slot` past the end of `area`'s table.
+fn first_call_past_end(area: &'static str, slot: usize) -> bool {
+    static CALLED: Mutex<Vec<(&str, usize)>> = Mutex::new(Vec::new());
+    let mut called = CALLED.lock().unwrap_or_else(|e| e.into_inner());
+    let first = !called.contains(&(area, slot));
+    if first {
+        called.push((area, slot));
+    }
+    first
+}
 
 /// A (provider, interface id) pair a title may ask for, and our object.
 pub type Interface = (Guid, Guid, &'static Object);
@@ -178,6 +251,31 @@ pub(crate) fn method<F: Copy>(object: &Object, slot: usize) -> F {
     // SAFETY: the caller names the slot's signature; tables cover the slots
     // tests use.
     unsafe { std::mem::transmute_copy(&*object.vtable.add(slot / 8)) }
+}
+
+/// Checks that `object`'s guard answers every slot past its methods, called
+/// with arguments as title code would; the object's area is not otherwise
+/// touched.
+#[cfg(test)]
+pub(crate) fn assert_guarded(object: &Object) {
+    type Any = extern "system" fn(*const Object, usize, usize, usize, usize, usize) -> HRESULT;
+    for index in object.methods..object.methods + PAST_END_SLOTS {
+        // The stub for this very slot, so the log names the slot called.
+        let stub = method::<*const ()>(object, index * 8);
+        assert_eq!(
+            stub,
+            PAST_END[index / 10][index % 10],
+            "{} slot {index}",
+            object.area
+        );
+        let call = method::<Any>(object, index * 8);
+        assert_eq!(
+            call(object, 1, 2, 3, 4, 5),
+            xasync::E_NOTIMPL,
+            "{} slot {index}",
+            object.area
+        );
+    }
 }
 
 pub extern "system" fn XGameRuntimeInitialize() -> HRESULT {
@@ -291,6 +389,43 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
     use crate::modules::kernel::{FreeLibrary, GetProcAddress, LoadLibraryExA};
+
+    #[test]
+    fn every_area_table_is_guarded_past_its_methods() {
+        let objects: Vec<&Object> = AREAS
+            .iter()
+            .flat_map(|area| area.iter().map(|&(_, _, object)| object))
+            .collect();
+        assert!(objects.len() > 10);
+        for object in objects {
+            assert_guarded(object);
+        }
+    }
+
+    #[test]
+    fn a_call_past_the_end_returns_e_notimpl_and_is_logged_once() {
+        static TABLE: Methods<4> = Methods::new([
+            missing::<0> as *const (),
+            add_ref as *const (),
+            add_ref as *const (),
+            missing::<3> as *const (),
+        ]);
+        static OBJECT: Object = Object::new("guard test", &TABLE);
+        // Slot 4 (0x20) is the first past the end; called with arguments.
+        type Call = extern "system" fn(*const Object, u32, *mut c_void, u64) -> HRESULT;
+        let call = method::<Call>(&OBJECT, 0x20);
+        assert_eq!(call(&OBJECT, 7, std::ptr::null_mut(), 9), xasync::E_NOTIMPL);
+        assert_eq!(call(&OBJECT, 7, std::ptr::null_mut(), 9), xasync::E_NOTIMPL);
+        let last = method::<Call>(&OBJECT, (4 + PAST_END_SLOTS - 1) * 8);
+        assert_eq!(last(&OBJECT, 0, std::ptr::null_mut(), 0), xasync::E_NOTIMPL);
+        // Both slots already logged; another slot is not.
+        assert!(!first_call_past_end("guard test", 4));
+        assert!(!first_call_past_end("guard test", 4 + PAST_END_SLOTS - 1));
+        assert!(first_call_past_end("guard test", 5));
+        // Existing slots are unchanged.
+        type AddRef = extern "system" fn(*const Object) -> u32;
+        assert_eq!(method::<AddRef>(&OBJECT, 0x08)(&OBJECT), 1);
+    }
 
     #[test]
     fn title_stub_loads_the_runtime_dynamically() {

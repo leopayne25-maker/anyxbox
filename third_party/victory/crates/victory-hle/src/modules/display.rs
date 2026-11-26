@@ -136,7 +136,7 @@ extern "system" fn take_screenshot(_: This, _user: *const c_void, _result: *mut 
     NOT_SUPPORTED
 }
 
-static HDR_VTABLE: Methods<5> = Methods([
+static HDR_VTABLE: Methods<5> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -145,7 +145,7 @@ static HDR_VTABLE: Methods<5> = Methods([
 ]);
 
 #[cfg(windows)]
-static SHELL_VTABLE: Methods<6> = Methods([
+static SHELL_VTABLE: Methods<6> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -154,14 +154,14 @@ static SHELL_VTABLE: Methods<6> = Methods([
     close_deferral as *const (),   // 0x28
 ]);
 #[cfg(not(windows))]
-static SHELL_VTABLE: Methods<4> = Methods([
+static SHELL_VTABLE: Methods<4> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
     launch_uri as *const (),
 ]);
 
-static CAPTURE_VTABLE: Methods<6> = Methods([
+static CAPTURE_VTABLE: Methods<6> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),

@@ -161,7 +161,7 @@ extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::XAsyncGetResult(block, (&raw const PROMPT).cast(), 0, none, none.cast())
 }
 
-static VTABLE: Methods<8> = Methods([
+static VTABLE: Methods<8> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),

@@ -987,7 +987,7 @@ extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
 /// which every runtime call in a title makes first.
 extern "system" fn m_check_thread(_: This) {}
 
-static VTABLE: Methods<31> = Methods([
+static VTABLE: Methods<31> = Methods::new([
     missing::<0> as *const (),         // 0x00 QueryInterface
     add_ref as *const (),              // 0x08 AddRef
     add_ref as *const (),              // 0x10 Release: the object is static

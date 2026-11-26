@@ -158,7 +158,7 @@ extern "system" fn write_event(
     S_OK
 }
 
-static TITLE_VTABLE: Methods<5> = Methods([
+static TITLE_VTABLE: Methods<5> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -166,14 +166,14 @@ static TITLE_VTABLE: Methods<5> = Methods([
     launch_new_game as *const (), // 0x20
 ]);
 
-static FEATURES_VTABLE: Methods<4> = Methods([
+static FEATURES_VTABLE: Methods<4> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
     is_feature_available as *const (), // 0x18
 ]);
 
-static INVITES_VTABLE: Methods<5> = Methods([
+static INVITES_VTABLE: Methods<5> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -181,7 +181,7 @@ static INVITES_VTABLE: Methods<5> = Methods([
     unregister as *const (), // 0x20
 ]);
 
-static EVENTS_VTABLE: Methods<4> = Methods([
+static EVENTS_VTABLE: Methods<4> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),

@@ -95,7 +95,7 @@ extern "system" fn stream_data(
     S_OK
 }
 
-static VTABLE: Methods<22> = Methods([
+static VTABLE: Methods<22> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),

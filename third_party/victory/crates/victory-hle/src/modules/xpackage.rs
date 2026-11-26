@@ -268,7 +268,7 @@ extern "system" fn enumerate(
     S_OK
 }
 
-static VTABLE: Methods<40> = Methods([
+static VTABLE: Methods<40> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),

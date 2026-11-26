@@ -235,7 +235,7 @@ mod dialog {
     }
 }
 
-static VTABLE: Methods<20> = Methods([
+static VTABLE: Methods<20> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),

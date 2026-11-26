@@ -902,7 +902,7 @@ extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
 }
 
-static VTABLE: Methods<30> = Methods([
+static VTABLE: Methods<30> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),

@@ -269,7 +269,7 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
 
 // Unset slots (no title seen calls them): maximum users, gamer pictures,
 // the UTF-16 token calls, issue resolution.
-static VTABLE: Methods<35> = Methods([
+static VTABLE: Methods<35> = Methods::new([
     missing::<0> as *const (),             // 0x00 QueryInterface
     add_ref as *const (),                  // 0x08 AddRef
     add_ref as *const (),                  // 0x10 Release: the object is static
@@ -307,14 +307,14 @@ static VTABLE: Methods<35> = Methods([
     unregister as *const (),               // 0x110
 ]);
 
-static GAMERTAG_VTABLE: Methods<4> = Methods([
+static GAMERTAG_VTABLE: Methods<4> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
     get_gamertag as *const (), // 0x18
 ]);
 
-static DEVICE_VTABLE: Methods<6> = Methods([
+static DEVICE_VTABLE: Methods<6> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),

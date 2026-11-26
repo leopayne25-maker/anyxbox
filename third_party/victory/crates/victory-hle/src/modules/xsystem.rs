@@ -114,7 +114,7 @@ extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut Anal
     out
 }
 
-static VTABLE: Methods<6> = Methods([
+static VTABLE: Methods<6> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -123,7 +123,7 @@ static VTABLE: Methods<6> = Methods([
     device_id as *const (),  // 0x28
 ]);
 
-static ANALYTICS_VTABLE: Methods<4> = Methods([
+static ANALYTICS_VTABLE: Methods<4> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),

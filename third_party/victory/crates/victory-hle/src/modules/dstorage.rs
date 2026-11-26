@@ -237,7 +237,7 @@ fn text(name: *const c_char) -> String {
         .into_owned()
 }
 
-static FACTORY_VTABLE: Methods<16> = Methods([
+static FACTORY_VTABLE: Methods<16> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -300,7 +300,7 @@ fn reopened(file: &std::fs::File) -> Option<std::fs::File> {
     Some(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
-static FILE_VTABLE: Methods<8> = Methods([
+static FILE_VTABLE: Methods<8> = Methods::new([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
     release::<File> as *const (),
@@ -335,7 +335,7 @@ extern "system" fn is_complete(this: Array, index: u32) -> bool {
     status_result(this, index) != E_PENDING
 }
 
-static STATUS_VTABLE: Methods<5> = Methods([
+static STATUS_VTABLE: Methods<5> = Methods::new([
     missing::<0> as *const (),
     add_ref_instance::<StatusArray> as *const (),
     release::<StatusArray> as *const (),
@@ -1386,7 +1386,7 @@ fn filled(array: *const usize, n: usize) -> Vec<usize> {
 
 /// Slots by the 2020 order, which the argument shapes at
 /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
-static QUEUE_VTABLE: Methods<12> = Methods([
+static QUEUE_VTABLE: Methods<12> = Methods::new([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
@@ -1415,7 +1415,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::modules::xgameruntime::method;
+    use crate::modules::xgameruntime::{assert_guarded, method};
+
+    #[test]
+    fn every_table_is_guarded_past_its_methods() {
+        // The objects as created; their state lies past the header.
+        assert_guarded(&FACTORY_OBJECT);
+        assert_guarded(&Object::new("dstorage file", &FILE_VTABLE));
+        assert_guarded(&Object::new("dstorage status array", &STATUS_VTABLE));
+        assert_guarded(&Object::new("dstorage queue", &QUEUE_VTABLE));
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.

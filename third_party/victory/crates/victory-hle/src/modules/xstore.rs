@@ -332,7 +332,7 @@ extern "system" fn unregister(_: This, _: Handle, _token: u64, _wait: bool) -> b
     true
 }
 
-static VTABLE: Methods<76> = Methods([
+static VTABLE: Methods<76> = Methods::new([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
