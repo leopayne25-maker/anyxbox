@@ -711,12 +711,11 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// File source bytes a request can buffer while running. Raw reads to title
+/// addresses use a bounce buffer for guarded pages. Reads to physical pages
+/// may need a scatter buffer. Memory sources have no file input to stage.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
+    if request.options & MEMORY_SOURCE == 0 {
         u64::from(request.source_size)
     } else {
         0
@@ -927,6 +926,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
                 return read_into(request, out).map(|()| size);
             }
             let mut data = vec![0; size];
+            #[cfg(test)]
+            tests::staging::observe_bounce(data.len());
             read_into(request, &mut data)?;
             out.copy_from_slice(&data);
             Ok(size)
@@ -1417,6 +1418,8 @@ mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
 
+    pub(super) mod staging;
+
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
         method(unsafe { &*object.cast::<Object>() }, slot)
@@ -1728,25 +1731,29 @@ mod tests {
     }
 
     #[test]
-    fn staging_bounds_compressed_bytes_in_flight() {
+    fn staging_bounds_file_bytes_in_flight() {
         let mut l = lanes(100);
         l.lanes.insert(0, Lane::new(0, 64));
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
-        read(&mut l, 0, 0, 1000); // raw: straight to its destination
+        read(&mut l, 0, MEMORY_SOURCE, 1000);
         l.submit(0);
         let first = l.start().unwrap();
         assert!(l.start().is_none(), "60 + 60 > 100");
         l.finish(&first, Ok(()));
         let second = l.start().unwrap();
-        let raw = l.start().unwrap();
-        assert_eq!((second.staging, raw.staging), (60, 0));
-        // Alone, a request larger than the buffer still runs.
-        read(&mut l, 0, ZLIB, 500);
+        let memory = l.start().unwrap();
+        assert_eq!((second.staging, memory.staging), (60, 0));
+        l.finish(&memory, Ok(()));
+        // A file read larger than the budget can still run with empty staging.
+        read(&mut l, 0, 0, 500);
         l.submit(0);
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
-        assert!(l.start().is_some());
+        let oversized = l.start().unwrap();
+        assert_eq!(oversized.staging, 500);
+        l.finish(&oversized, Ok(()));
+        assert_eq!(l.staged, 0);
     }
 
     #[test]
