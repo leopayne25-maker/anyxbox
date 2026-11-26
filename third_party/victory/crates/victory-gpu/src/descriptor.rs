@@ -125,13 +125,33 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
+///
+/// Read far more often than written: every view the title's recording
+/// threads write looks its heap up here ([`shader_slot`]), and the
+/// submitting thread reads the list for the whole of [`sync_heaps`], once
+/// per submission. Only making and dropping a heap writes it. As a mutex,
+/// the recording threads stood behind that pass at each submission: in a
+/// profile of the world (30 s, 263 frames) each of the five stood 12-13 % of
+/// the time in contended locks, 6.7 % of it in this lookup.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// [`SHADER_HEAPS`] for looking up: shared with every other reader.
+#[cfg(windows)]
+fn heaps_read() -> std::sync::RwLockReadGuard<'static, Vec<(u64, u64, usize)>> {
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`SHADER_HEAPS`] for a heap made or dropped.
+#[cfg(windows)]
+fn heaps_write() -> std::sync::RwLockWriteGuard<'static, Vec<(u64, u64, usize)>> {
+    SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps_read();
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
@@ -179,7 +199,8 @@ pub(crate) fn sync_heaps() {
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let mut asked: Vec<u32> = Vec::new();
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    // Shared: the title's threads go on looking heaps up meanwhile.
+    let heaps = heaps_read();
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -296,7 +317,7 @@ fn changed_slots(
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps_read();
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -309,7 +330,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = heaps_write();
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -819,12 +840,7 @@ pub(crate) fn evictable_slots(
     frame: u64,
 ) -> std::collections::HashMap<usize, Vec<(usize, u32)>> {
     let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
-    let heaps: Vec<usize> = SHADER_HEAPS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .map(|&(_, _, h)| h)
-        .collect();
+    let heaps: Vec<usize> = heaps_read().iter().map(|&(_, _, h)| h).collect();
     let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
     let mut blocked = std::collections::HashSet::new();
     for at in heaps {
@@ -852,7 +868,7 @@ pub(crate) fn evictable_slots(
 pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
     let mut n = 0;
     for &(at, index) in slots {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = heaps_read();
         if !heaps.iter().any(|&(_, _, h)| h == at) {
             continue;
         }
@@ -1235,7 +1251,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = heaps_write();
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -1286,6 +1302,83 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// A title thread that writes a view looks its heap up while the
+    /// submitting thread holds the heap list for its pass over copied
+    /// records ([`sync_heaps`] reads it from start to end): the lookup does
+    /// not wait for the pass.
+    #[cfg(windows)]
+    #[test]
+    fn a_heap_lookup_goes_on_during_the_pass_over_copied_records() {
+        let _alone = HEAP_LIST_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // A heap another test makes or drops meanwhile waits for the pass,
+        // and a lookup then waits behind it: such a try is made again. A
+        // lookup that waits for the pass itself waits in every try.
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let pass = heaps_read();
+            let (done, seen) = std::sync::mpsc::channel();
+            let lookup = std::thread::spawn(move || {
+                // No heap lies at address 8: the lookup only reads the list.
+                let found = shader_slot(8).is_some();
+                let _ = done.send(found);
+            });
+            let found = seen.recv_timeout(std::time::Duration::from_secs(1));
+            drop(pass);
+            let _ = lookup.join();
+            if found.is_ok() || tries == 5 {
+                assert_eq!(
+                    found,
+                    Ok(false),
+                    "the lookup waited for the pass over the heap list ({tries} tries)"
+                );
+                break;
+            }
+        }
+    }
+
+    /// The two tests above and below hold the heap list on purpose.
+    #[cfg(windows)]
+    static HEAP_LIST_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Making a heap waits for the readers of the list, and is seen by the
+    /// next lookup.
+    #[cfg(windows)]
+    #[test]
+    fn a_heap_made_after_the_pass_is_found() {
+        let _alone = HEAP_LIST_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let desc = HeapDesc {
+            kind: 0,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let pass = heaps_read();
+        let (made, out) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut h = std::ptr::null();
+            let hr = create(desc, none, &mut h);
+            let _ = made.send((hr, h as usize));
+        });
+        // The making stands behind the pass.
+        assert!(
+            out.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+        );
+        drop(pass);
+        let (hr, h) = out
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the heap was made once the pass ended");
+        assert_eq!(hr, S_OK);
+        let start = heap(h as This).start;
+        assert_eq!(shader_slot(start + 32).map(|(_, index)| index), Some(1));
+        release(h as This);
     }
 
     #[cfg(windows)]
