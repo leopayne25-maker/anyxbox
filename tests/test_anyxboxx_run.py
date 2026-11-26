@@ -22,9 +22,10 @@ PLAY = REPO / "third_party" / "victory" / "scripts" / "play.ps1"
 SETTINGS = REPO / "crates" / "anyxboxx" / "src" / "run" / "settings.rs"
 CARGO_FAILURE, VICTORY_EXIT = 101, 7
 GAME_DIR = "VICTORY_GAME_DIR=<root>\\game"
-BUILD = r"cargo build --release -p victory --manifest-path <root>\depot\third_party\victory\Cargo.toml | "
+BUILD = (r"cargo build --release -p victory --manifest-path <root>\depot\third_party\victory\Cargo.toml "
+         "--message-format=json-render-diagnostics | ")
 BUILD_DIAG = (r"cargo build --profile diag -p victory --features diagnostics "
-              r"--manifest-path <root>\depot\third_party\victory\Cargo.toml | ")
+              r"--manifest-path <root>\depot\third_party\victory\Cargo.toml --message-format=json-render-diagnostics | ")
 GAME = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_DIAG = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_ARCHIVES = r"<root>\game\A.rpf <root>\game\b.rpf"
@@ -99,6 +100,20 @@ public static class FakeTool {
         string key = "FAKE_TOOL_EXIT_" + name.ToUpperInvariant();
         string code = Environment.GetEnvironmentVariable(args.Length > 0 ? key + "_" + args[0].ToUpperInvariant() : key)
                       ?? Environment.GetEnvironmentVariable(key);
+        if (name == "cargo" && args.Contains("--message-format=json-render-diagnostics")) {
+            Console.OutputEncoding = new System.Text.UTF8Encoding(false);
+            string exe = Environment.GetEnvironmentVariable("FAKE_CARGO_ARTIFACT");
+            if (exe == null) {
+                string profile = args.Contains("--profile") ? "diag" : "release";
+                exe = Path.Combine(Environment.GetEnvironmentVariable("CARGO_TARGET_DIR"), profile, "victory.exe");
+            }
+            Console.WriteLine("{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"victory\",\"kind\":[\"lib\"]},\"executable\":\"ignored.exe\"}");
+            int count = int.Parse(Environment.GetEnvironmentVariable("FAKE_CARGO_ARTIFACT_COUNT") ?? "1");
+            for (int i = 0; i < count; i++) {
+                Console.WriteLine("{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"victory\",\"kind\":[\"bin\"]},\"executable\":\""
+                                  + exe.Replace("\\", "\\\\") + "\"}");
+            }
+        }
         return string.IsNullOrEmpty(code) ? 0 : int.Parse(code);
     }
 }
@@ -248,6 +263,26 @@ def test_a_failed_build_stops_the_launch(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, cargo_exit=CARGO_FAILURE)
     assert calls == [BUILD] and done.returncode == 1
     assert f"cargo build failed (exit code {CARGO_FAILURE})" in done.stderr
+
+
+def test_cargo_reported_executable_runs_warm_and_game(tmp_path, fake_tool, binary, monkeypatch):
+    output = tmp_path / "répertoire Cargo" / "reported.exe"
+    output.parent.mkdir()
+    shutil.copy(fake_tool, output)
+    monkeypatch.setenv("FAKE_CARGO_ARTIFACT", str(output))
+    monkeypatch.setenv("FAKE_TOOL_EXIT_REPORTED_RUN", str(VICTORY_EXIT))
+    done, calls = launch(tmp_path, fake_tool, binary, ["--warm"])
+    assert calls == [BUILD, WARM_ARCHIVES.replace("victory ", "reported ", 1) + default_env(),
+                     GAME.replace("victory ", "reported ", 1) + default_env()], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_build_requires_exactly_one_victory_artifact(tmp_path, fake_tool, binary, monkeypatch, count):
+    monkeypatch.setenv("FAKE_CARGO_ARTIFACT_COUNT", str(count))
+    done, calls = launch(tmp_path, fake_tool, binary)
+    assert calls == [BUILD] and done.returncode == 1
+    assert f"cargo build reported {count} VIctory executables" in done.stderr
 
 
 def test_a_missing_game_stops_before_building(tmp_path, fake_tool, binary):
