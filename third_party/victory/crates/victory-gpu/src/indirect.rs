@@ -284,8 +284,17 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let (c, budget, (dst, from)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    recorded(list, record_clamp_as(c, &list.list, (&dst, from), budget, src, count, spec, 0), dst)
+}
+
+/// `dst` if the clamp into it was recorded: it is left readable as
+/// arguments (until the next clamp or the list's close).
+fn recorded(list: &HostList, recorded: bool, dst: ID3D12Resource) -> Option<ID3D12Resource> {
+    recorded.then(|| {
+        list.indirect_readable();
+        dst
+    })
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -304,8 +313,8 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
+    let (c, budget, (dst, from)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    recorded(list, record_clamp_as(c, &list.list, (&dst, from), budget, src, None, spec, AHEAD), dst)
 }
 
 /// (Neptune) `VICTORY_CLAMP_AFTER_WRITER=1` (off by default): a single indirect record that an
@@ -547,14 +556,16 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
     let spec = (2, 12, 1);
     validate_layout(spec, src.1, None)?;
     let (c, budget) = (clamp()?, list.budget()?);
-    let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
+    let (dst, from) = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
+    recorded(list, record_clamp_as(c, &list.list, (&dst, from), budget, src, None, spec, IN_PARTS), dst)
 }
 
 /// Bits of the clamp's `has_count`.
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 4;
 
+/// [`record_clamp_as`] of a scratch buffer in the common state.
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -564,17 +575,20 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, 0)
+    record_clamp_as(c, l, (dst, D3D12_RESOURCE_STATE_COMMON), budget, src, count, spec, 0)
 }
 
-/// [`record_clamp`]; `how`: [`AHEAD`], the records are a window clamped
-/// ahead of their draws ([`bound_ahead`]); [`IN_PARTS`], one dispatch in
-/// parts ([`bound_split`]).
+/// Records the clamp into `dst`, in state `from` (common, or indirect
+/// argument as the clamp before left it: the executions since have read
+/// it), and leaves it in the indirect-argument state. `how`: 0, records as
+/// given ([`bound`]); [`AHEAD`], the records are a window clamped ahead of
+/// their draws ([`bound_ahead`]); [`IN_PARTS`], one dispatch in parts
+/// ([`bound_split`]).
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
+    (dst, from): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -628,7 +642,9 @@ fn record_clamp_as(
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // transitions `from -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT` (`from`:
+    // `COMMON`, or `INDIRECT_ARGUMENT` after earlier executions, whose reads
+    // the move to `UNORDERED_ACCESS` waits for).
     // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
@@ -639,11 +655,7 @@ fn record_clamp_as(
     let waits = true;
     let first = [
         uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
+        transition(dst, from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
     let second = [
         uav_barrier(),
@@ -766,12 +778,8 @@ pub(crate) fn record_ahead(
     }
 }
 
-/// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call.
-pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
-    done_on(&list.list, scratch);
-}
-
+/// A scratch buffer of the tests' own after its execution: back to common.
+#[cfg(test)]
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
     unsafe {
@@ -794,6 +802,9 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         },
     }
 }
+
+#[cfg(all(test, windows))]
+mod args_state_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1626,7 +1637,7 @@ void main() {
             assert!(record_clamp_as(
                 &warp.clamp,
                 &warp.list,
-                &dst_buf,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
                 budget_gpu,
                 (&src_buf, 0),
                 None,
@@ -1679,7 +1690,7 @@ void main() {
             assert!(record_clamp_as(
                 &warp.clamp,
                 &warp.list,
-                &dst_buf,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
                 budget_gpu,
                 (&src_buf, 0),
                 None,
@@ -1833,7 +1844,7 @@ void main() {
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
     }
 
-    /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
+    /// Exercises `HostList::indirect_scratch`, `bound`, `Host::execute`,
     /// and `HostList::reset` end-to-end on the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
@@ -1858,9 +1869,7 @@ void main() {
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`.
         let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
-        done(&list, &b1);
         let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
-        done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
@@ -1870,7 +1879,6 @@ void main() {
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
         // `b1` alive until reset.
         let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
-        done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
             b1.as_raw(),
@@ -1884,7 +1892,6 @@ void main() {
         // After reset, requests up to the grown high-water mark reuse `b3` with
         // zero new allocations.
         let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        done(&list, &b4);
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),

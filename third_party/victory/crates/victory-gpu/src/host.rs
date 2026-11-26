@@ -950,6 +950,16 @@ mod tests {
     }
 }
 
+/// A list's buffer of clamped indirect arguments, with its width, and
+/// whether a clamp left it readable as arguments (it is common otherwise):
+/// it stays so after the execution, until the next clamp or the list's
+/// close.
+#[derive(Default)]
+struct IndirectArgs {
+    buffer: Option<(ID3D12Resource, u64)>,
+    readable: bool,
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -980,10 +990,13 @@ pub(crate) struct HostList {
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// (Its GPU address kept: asked for every indirect execution.)
+    budget: OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    indirect_args: Mutex<IndirectArgs>,
+    /// The host pipeline last kept by [`HostList::holds_pipeline`].
+    kept_pipeline: std::sync::atomic::AtomicUsize,
     /// (Neptune) The buffers the clamps recorded in the prelude write their
     /// records into ([`HostList::clamp_ahead`]), and whether a prelude has
     /// left each in the indirect-argument state. Kept across resets.
@@ -4838,6 +4851,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                kept_pipeline: std::sync::atomic::AtomicUsize::new(0),
                 ahead_chunks: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -7323,6 +7337,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         self.textures_back();
+        self.indirect_args_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -7346,6 +7361,8 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).readable = false;
+        self.kept_pipeline.store(0, Ordering::Relaxed);
         self.changes.fetch_add(1, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -8045,11 +8062,13 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        let (_, data, gpu) = self
             .budget
             .get_or_init(|| {
                 let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                // SAFETY: a live buffer.
+                let gpu = unsafe { b.GetGPUVirtualAddress() };
+                Some((b, d as usize, gpu))
             })
             .as_ref()?;
         let mut deferred = self.deferred();
@@ -8077,35 +8096,83 @@ impl HostList {
                 }
             })));
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some(*gpu)
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
     /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    /// list, and the state it is in: common, or indirect argument as the
+    /// last clamp left it (the executions after only read it). A clamp that
+    /// records its moves says so ([`HostList::indirect_readable`]); the
+    /// list's close brings it back to common, so between lists it is always
+    /// common. Smaller buffers replaced mid-list are brought back to common
+    /// and stay alive until [`HostList::reset`].
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<(ID3D12Resource, D3D12_RESOURCE_STATES)> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
+        let state = if slot.readable {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        if let Some((buffer, cap)) = &slot.buffer
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            return Some((buffer.clone(), state));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.buffer.as_ref().map_or(0, |(_, cap)| *cap);
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.buffer.replace((buffer.clone(), alloc));
+        let readable = std::mem::take(&mut slot.readable);
         drop(slot);
         if let Some((old_buf, _)) = old {
+            if readable {
+                // SAFETY: an open list and a live buffer, in the state named.
+                unsafe {
+                    self.list.ResourceBarrier(&[transition(
+                        &old_buf,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )])
+                };
+            }
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, D3D12_RESOURCE_STATE_COMMON))
+    }
+
+    /// A clamp recorded the moves of the list's argument buffer
+    /// ([`HostList::indirect_scratch`]) to the indirect-argument state.
+    pub(crate) fn indirect_readable(&self) {
+        self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).readable = true;
+    }
+
+    /// The list's argument buffer back to common if a clamp left it
+    /// readable as arguments: every list leaves it common.
+    fn indirect_args_back(&self) {
+        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let (true, Some((buffer, _))) = (std::mem::take(&mut slot.readable), &slot.buffer) {
+            // SAFETY: an open list and a live buffer, in the state named.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )])
+            };
+        }
+    }
+
+    /// Whether the list already holds host pipeline `pipeline`: the one it
+    /// was last asked about since its reset. A pipeline bound again after
+    /// the indirect clamp's own is kept once.
+    pub(crate) fn holds_pipeline(&self, pipeline: usize) -> bool {
+        self.kept_pipeline.swap(pipeline, Ordering::Relaxed) == pipeline
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -10135,6 +10202,37 @@ impl Host {
     }
 }
 
+/// The transitions [`transition`] built on each thread (tests): what a
+/// list records, to replay by the debug layer's rule where it is missing.
+#[cfg(test)]
+pub(crate) mod barrier_log {
+    thread_local! {
+        /// (resource, before, after), in order.
+        pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The transitions built on this thread since the last call.
+    pub(crate) fn issued() -> Vec<(usize, u32, u32)> {
+        ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    /// Replays transitions in order from the states in `states` (resources
+    /// not in it are not checked), by the debug layer's rule: each
+    /// barrier's before-state is the resource's current one. The first
+    /// that is not, else the states after.
+    pub(crate) fn replay(issued: &[(usize, u32, u32)], states: &mut std::collections::HashMap<usize, u32>) -> Result<(), String> {
+        for (k, &(resource, before, after)) in issued.iter().enumerate() {
+            if let Some(state) = states.get_mut(&resource) {
+                if *state != before {
+                    return Err(format!("barrier {k} on {resource:#x}: before {before:#x}, but the resource is in {state:#x}"));
+                }
+                *state = after;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// For adapters without device-removed data (the software one): the last
 /// commands each list of the failed submission noted (diagnostics, with
 /// `VICTORY_D3D12_DRED`).
@@ -10209,6 +10307,8 @@ pub(crate) fn transition(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> D3D12_RESOURCE_BARRIER {
+    #[cfg(test)]
+    barrier_log::ISSUED.with(|l| l.borrow_mut().push((resource.as_raw() as usize, before.0 as u32, after.0 as u32)));
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
