@@ -1368,6 +1368,55 @@ def vop3(name, vdst, sources, op_sel=0, clamp=0, abs_bits=0, neg=0, omod=0):
     return low, sources[0] | sources[1] << 9 | sources[2] << 18 | omod << 27 | neg << 29
 
 
+# Source registers of the register-group tests, filled with a different value in every lane and register,
+# so that the programs that fit write non-zero, distinguishable results.
+GROUP_SOURCES = (*range(1, 8), *range(250, 256))
+
+
+def fill_group_sources():
+    """v_mul_u32_u24 vN = (0x12345 + 0x1111 × N) × lane, for every register of GROUP_SOURCES."""
+    words = []
+    for register in GROUP_SOURCES:
+        words += [vop2("v_mul_u32_u24", register, LITERAL, 0), 0x12345 + 0x1111 * register]
+    return words
+
+
+def test_a_register_group_past_v255_is_an_operand_error_in_rust():
+    """A 64-bit result at v255 has no second register, a 64-bit source pair at v255 neither, and a 128-bit
+    group has none from v253 up. The Rust returns an operand error before writing anything (it used to
+    abort on an out-of-bounds index). The Python model raises IndexError, after writing the low half in
+    the first active lane: that is a crash, not a refusal, and the parity harness turns it into no error
+    line, so the two cannot be compared on these programs yet. Whether the Python should refuse them
+    (and both print the same error line) is left to the maintainers; this test pins the current pairing.
+    The same group one register lower fits, and both models run it to the same state."""
+    exe = binary()
+    wide, quad = (V0 + 2, V0 + 4, V0 + 6), (V0 + 2, V0 + 1, V0 + 4)
+    cases = [                                                        # (name, sources, last register that fits)
+        ("v_ashrrev_i64", (129, V0 + 2, 128), 254), ("v_add_f64", wide, 254), ("v_fma_f64", wide, 254),
+        ("v_div_scale_f64", wide, 254), ("v_div_fmas_f64", wide, 254), ("v_div_fixup_f64", wide, 254),
+        ("v_mad_u64_u32", (V0 + 1, V0 + 3, V0 + 2), 254), ("v_qsad_pk_u16_u8", quad, 254),
+        ("v_mqsad_pk_u16_u8", quad, 254), ("v_mqsad_u32_u8", quad, 252),
+    ]
+    programs = [(program(*fill_group_sources(), *vop3(name, last + 1, sources)),
+                 program(*fill_group_sources(), *vop3(name, last, sources)))
+                for name, sources, last in cases]
+    for name in ("v_floor_f64", "v_cvt_f64_i32"):                    # VOP1: a 64-bit result from one source
+        programs.append((program(*fill_group_sources(), vop1(name, 255, V0 + 2)),
+                         program(*fill_group_sources(), vop1(name, 254, V0 + 2))))
+    # The wide S2 source of the SAD forms: a 64-bit pair at v255 (then v254), four VGPRs at v253 (then v252).
+    for name, past, fits in (("v_qsad_pk_u16_u8", 255, 254), ("v_mqsad_pk_u16_u8", 255, 254),
+                             ("v_mqsad_u32_u8", 253, 252)):
+        programs.append((program(*fill_group_sources(), *vop3(name, 8, (V0 + 2, V0 + 1, V0 + past))),
+                         program(*fill_group_sources(), *vop3(name, 8, (V0 + 2, V0 + 1, V0 + fits)))))
+    for past, fits in programs:
+        assert run_rust(exe, 32, False, [], past) == "error operand\n"
+        with pytest.raises(IndexError):
+            run_python(32, False, [], past)
+        state = run_python(32, False, [], fits)
+        assert state.startswith("steps")
+        assert_same(exe, 32, False, [], fits)
+
+
 def test_vop3_integer_clamp_matches_the_python_model():
     exe = binary()
     names = ("v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_add_co_u32",
