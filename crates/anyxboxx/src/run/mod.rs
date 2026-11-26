@@ -107,6 +107,8 @@ pub enum RunError {
     NoGame(String),
     #[error("cargo build failed (exit code {0}).")]
     BuildFailed(i32),
+    #[error("cargo build reported {0} VIctory executables, expected one.")]
+    BuildArtifactCount(usize),
     #[error("--precompile needs {0:?}.")]
     PrecompileInput(String),
     #[error("--warm found no .rpf archive in {0:?}.")]
@@ -120,7 +122,7 @@ pub enum RunError {
 /// Runs the launch like the script, step for step; returns VIctory's exit code. With
 /// `--victory-exe` the build is skipped and the repository is not needed.
 pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
-    let victory = match (&args.victory_exe, repo) {
+    let mut victory = match (&args.victory_exe, repo) {
         (Some(exe), _) => Victory::prebuilt(exe)?,
         (None, Some(repo)) => Victory::locate(repo, args.uses_diag())?,
         (None, None) => return Err(RunError::NoRepo),
@@ -133,10 +135,7 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
             "release"
         };
         println!("Building VIctory ({profile})...");
-        let code = status(&mut build, "cargo")?;
-        if code != 0 {
-            return Err(RunError::BuildFailed(code));
-        }
+        victory.exe = steps::build_executable(&mut build)?;
     }
     let env = environment(args)?;
     if args.warm {

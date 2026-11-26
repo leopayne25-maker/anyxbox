@@ -3,7 +3,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::{RunArgs, RunError, settings};
 
@@ -155,6 +155,43 @@ pub fn environment(args: &RunArgs) -> Result<Env, RunError> {
 fn pairs(env: &Env) -> impl Iterator<Item = (&OsStr, &OsStr)> {
     env.iter()
         .map(|(k, v)| (OsStr::new(k.as_str()), v.as_os_str()))
+}
+
+/// Ask Cargo for the executable path so custom targets and target directories work.
+pub(super) fn build_executable(command: &mut Command) -> Result<PathBuf, RunError> {
+    let output = command
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| RunError::Spawn("cargo".into(), e))?;
+    if !output.status.success() {
+        return Err(RunError::BuildFailed(output.status.code().unwrap_or(1)));
+    }
+    let executables: Vec<_> = output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter_map(|message| {
+            let target = &message["target"];
+            let is_binary = target["kind"]
+                .as_array()
+                .is_some_and(|kind| kind.iter().any(|k| k == "bin"));
+            if message["reason"] != "compiler-artifact" || target["name"] != "victory" || !is_binary {
+                return None;
+            }
+            message["executable"]
+                .as_str()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        })
+        .collect();
+    let [executable] = executables.as_slice() else {
+        return Err(RunError::BuildArtifactCount(executables.len()));
+    };
+    if !executable.is_file() {
+        return Err(RunError::NoVictoryExe(executable.display().to_string()));
+    }
+    Ok(executable.clone())
 }
 
 /// Waits for the command; a process killed without exit code counts as 1, like PowerShell.
