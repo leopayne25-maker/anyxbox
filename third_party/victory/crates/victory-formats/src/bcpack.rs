@@ -252,6 +252,64 @@ impl Tables {
     }
 }
 
+/// Maximum retained capacity of the thread-local decoded lane-record scratch
+/// buffer; larger decodes release their buffer on exit so idle workers do not
+/// retain huge allocations.
+const RECORDS_CAP: usize = 4 << 20;
+
+thread_local! {
+    static RECORDS_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PLAIN_HISTORY: std::cell::RefCell<Vec<Plain>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BC6_HISTORY: std::cell::RefCell<Vec<(Bc6Ep, Bc6Ix)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BC7_HISTORY: std::cell::RefCell<Vec<(Bc7Ep, Bc7Ix)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_records_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    struct Guard(Option<Vec<u8>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some(buf) = self.0.take()
+                && buf.capacity() <= RECORDS_CAP
+            {
+                let _ = RECORDS_SCRATCH.try_with(|cell| {
+                    if let Ok(mut slot) = cell.try_borrow_mut() {
+                        *slot = buf;
+                    }
+                });
+            }
+        }
+    }
+    let mut buf = RECORDS_SCRATCH
+        .try_with(|cell| cell.try_borrow_mut().ok().map(|mut s| std::mem::take(&mut *s)))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+    let mut guard = Guard(Some(buf));
+    let slice = &mut guard.0.as_mut().unwrap()[..len];
+    f(slice)
+}
+
+fn with_history<T: Clone + Default, R>(
+    cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>,
+    f: impl FnOnce(&mut [T]) -> R,
+) -> R {
+    let mut f = Some(f);
+    if let Ok(Some(out)) = cell.try_with(|c| {
+        let mut h = c.try_borrow_mut().ok()?;
+        if h.len() < HISTORY {
+            h.resize_with(HISTORY, T::default);
+        }
+        Some(f.take().unwrap()(&mut h[..HISTORY]))
+    }) {
+        return out;
+    }
+    let mut fallback = vec![T::default(); HISTORY];
+    f.take().unwrap()(&mut fallback)
+}
+
 /// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
@@ -274,20 +332,21 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
     let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
-    let out = dst.chunks_exact_mut(block);
-    let t = tables;
-    match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
-    }
+    with_records_scratch(blocks * stride, |records| {
+        let mut next = src.iter().copied();
+        lanes(tables, widths, per, blocks, |_| next.next(), records)?;
+        let records = records.chunks_exact(stride);
+        let out = dst.chunks_exact_mut(block);
+        let t = tables;
+        match bc {
+            1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
+            3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
+            4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
+            5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
+            6 => bc6(records, out, &t.bc6),
+            _ => bc7(records, out, t),
+        }
+    })
 }
 
 // Lanes.
@@ -534,23 +593,24 @@ fn plain<'a>(
     residual: impl Fn(&[u8]) -> Plain,
     pack: fn(&Plain, &mut [u8]),
 ) -> Result<(), Error> {
-    let mut history = vec![Plain::default(); HISTORY];
-    let zero = Plain::default();
-    for (i, (s, block)) in records.zip(out).enumerate() {
-        let (ep_ref, ix_ref) = references(s, w.paired);
-        let ep_ref = &pick(i, ep_ref, &history, dictionary, &zero).ep;
-        let ix_ref = &pick(i, ix_ref, &history, dictionary, &zero).ix;
-        let mut v = residual(s);
-        for ((v, r), bits) in v.ep.iter_mut().zip(ep_ref).zip(w.ep) {
-            *v = v.wrapping_add(*r) & ((1u16 << bits) - 1) as u8;
+    with_history(&PLAIN_HISTORY, |history| {
+        let zero = Plain::default();
+        for (i, (s, block)) in records.zip(out).enumerate() {
+            let (ep_ref, ix_ref) = references(s, w.paired);
+            let ep_ref = &pick(i, ep_ref, history, dictionary, &zero).ep;
+            let ix_ref = &pick(i, ix_ref, history, dictionary, &zero).ix;
+            let mut v = residual(s);
+            for ((v, r), bits) in v.ep.iter_mut().zip(ep_ref).zip(w.ep) {
+                *v = v.wrapping_add(*r) & ((1u16 << bits) - 1) as u8;
+            }
+            for ((v, r), bits) in v.ix.iter_mut().zip(ix_ref).zip(w.ix) {
+                *v = v.wrapping_add(*r) & ((1u8 << bits) - 1);
+            }
+            history[i % HISTORY] = v;
+            pack(&v, block);
         }
-        for ((v, r), bits) in v.ix.iter_mut().zip(ix_ref).zip(w.ix) {
-            *v = v.wrapping_add(*r) & ((1u8 << bits) - 1);
-        }
-        history[i % HISTORY] = v;
-        pack(&v, block);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// 2-bit index residuals: one symbol per 2x2 quad.
@@ -762,7 +822,15 @@ fn bc7<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     t: &Tables,
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
+    with_history(&BC7_HISTORY, |history| bc7_with_history(records, out, t, history))
+}
+
+fn bc7_with_history<'a>(
+    records: impl Iterator<Item = &'a [u8]>,
+    out: impl Iterator<Item = &'a mut [u8]>,
+    t: &Tables,
+    history: &mut [(Bc7Ep, Bc7Ix)],
+) -> Result<(), Error> {
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
@@ -1062,7 +1130,15 @@ fn bc6<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[(Bc6Ep, Bc6Ix)],
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
+    with_history(&BC6_HISTORY, |history| bc6_with_history(records, out, dictionary, history))
+}
+
+fn bc6_with_history<'a>(
+    records: impl Iterator<Item = &'a [u8]>,
+    out: impl Iterator<Item = &'a mut [u8]>,
+    dictionary: &[(Bc6Ep, Bc6Ix)],
+    history: &mut [(Bc6Ep, Bc6Ix)],
+) -> Result<(), Error> {
     let zero = (
         Bc6Ep::default(),
         Bc6Ix {
@@ -1604,5 +1680,22 @@ mod tests {
             let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
             assert!(ok, "entry {k}: {:?}", ix.ix);
         }
+    }
+
+    #[test]
+    fn records_scratch_reuses_capped_buffer_and_drops_oversized() {
+        let first = with_records_scratch(4096, |buf| {
+            buf.fill(0x5a);
+            buf.as_ptr() as usize
+        });
+        let second = with_records_scratch(1024, |buf| buf.as_ptr() as usize);
+        assert_eq!(first, second, "small decodes reuse the thread-local buffer");
+
+        with_records_scratch(RECORDS_CAP + 4096, |huge| {
+            huge[0] = 1;
+            huge[RECORDS_CAP] = 2;
+        });
+        let retained_cap = RECORDS_SCRATCH.with(|c| c.borrow().capacity());
+        assert!(retained_cap <= RECORDS_CAP);
     }
 }
