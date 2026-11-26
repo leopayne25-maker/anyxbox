@@ -35,6 +35,11 @@ mod descriptor_data;
 #[path = "float64.rs"]
 mod float64;
 
+/// Lane masks a join takes the same bits of on every way in (`joined_dword`), a child module
+/// so it shares the emitter's state.
+#[path = "lane_join.rs"]
+mod lane_join;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -3181,16 +3186,9 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        // A mask that holds lanes outside EXEC where it is written (the complement of one,
-        // say) is the ballot of the lanes that are there: all of them, where two exchanging
-        // host waves know every lane runs that block, and in the paired form, whose host wave
-        // runs every block with all its lanes.
-        let made = self.def_block.get(&lo).copied();
-        let whole = self.twin.is_some()
-            || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
-        if !self.x.st.active.contains(&lo) && !whole {
+        if self.elsewhere(lo) {
             if self.exchange.is_some() && !self.local {
-                need(made.unwrap_or(0));
+                need(self.def_block.get(&lo).copied().unwrap_or(0));
             }
             return Err(MASK_ELSEWHERE);
         }
@@ -3243,6 +3241,18 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Whether the mask with low dword `lo` holds lanes that do not run where it is written, so
+    /// that no ballot there is its number ([`MASK_ELSEWHERE`]). A mask that holds lanes outside
+    /// EXEC where it is written (the complement of one, say) is the ballot of the lanes that are
+    /// there: all of them, where two exchanging host waves know every lane runs that block, and
+    /// in the paired form, whose host wave runs every block with all its lanes.
+    fn elsewhere(&self, lo: Value) -> bool {
+        let made = self.def_block.get(&lo).copied();
+        let whole = self.twin.is_some()
+            || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        !self.x.st.active.contains(&lo) && !whole
     }
 
     // ---- operands ----
@@ -11215,13 +11225,14 @@ impl<'a> Lower<'a> {
                     }
                     // A lane mask joined with numbers (a traversal that keeps its lanes' masks on
                     // a stack with its node numbers): the mask comes as the number it is, the
-                    // ballot of its lanes where it is written.
+                    // ballot of its lanes where it is written (or, where the join takes one mask's
+                    // bits on every way in, that mask's: `joined_dword`).
                     (Some(Val::Missing(_)) | None, false)
                         if self.read_phis.contains(&phi.value)
                             && self.mask_data == MaskData::Console
                             && (st.masks.contains_key(&arg) || st.highs.contains_key(&arg)) =>
                     {
-                        match self.mask_dword(arg) {
+                        match self.joined_dword(phi.value, arg) {
                             Ok(x) => x,
                             Err(why) => return Err(Stop::Retry(phi.value, why)),
                         }
