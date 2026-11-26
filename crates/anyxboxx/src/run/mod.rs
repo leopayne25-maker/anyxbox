@@ -1,6 +1,7 @@
 //! `anyxboxx run`: builds VIctory (cargo does nothing when it is current) and launches it on the
 //! user's own game folder. It replaced main's `tools/lancer_victory.ps1` (same checks, build, warm
 //! and precompile steps, exit code); its tuned set is VIctory's own `scripts/play.ps1`.
+//! Warm and precompile share one invocation when both are requested.
 
 mod settings;
 mod steps;
@@ -126,6 +127,7 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
         (None, None) => return Err(RunError::NoRepo),
     };
     game_exe(&args.game_dir)?;
+    let warm = steps::warm_inputs(args)?;
     if let Some(mut build) = victory.build_command() {
         let profile = if args.uses_diag() {
             "diag profile, diagnostics feature"
@@ -140,17 +142,15 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
     }
     let env = environment(args)?;
     if args.warm {
-        let archives = warm_archives(&args.game_dir)?;
         println!(
-            "Warming the shader cache from the game's archives (about 7 minutes the first time)..."
+            "Warming the shader cache from {} game files (several minutes the first time)...",
+            warm.len()
         );
-        warm_or_fail(&mut victory.warm_command(&archives, &env))?;
+    } else if args.precompile {
+        println!("Precompiling the shaders of shaders.rpf, the game and its DLLs into the cache...");
     }
-    if args.precompile {
-        println!(
-            "Precompiling the shaders of shaders.rpf, the game and its DLLs into the cache..."
-        );
-        warm_or_fail(&mut victory.precompile_command(&args.game_dir, &env)?)?;
+    if !warm.is_empty() {
+        warm_or_fail(&mut victory.warm_command(&warm, &env))?;
     }
     status(&mut victory.game_command(&args.game_dir, &env), "victory")
 }
