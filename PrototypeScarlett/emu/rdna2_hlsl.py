@@ -117,7 +117,7 @@ def _vector(name, fields, literal, active=ACTIVE):
     values = {"a": a, "b": f"v[{fields['vsrc1']}]" if "vsrc1" in fields else "0u", "c": "s[106]",
               "d": f"v[{fields.get('vdst', 0)}]", "k": hexa(literal or 0)}
     if name == "v_readfirstlane_b32":
-        return [f"s[{fields['vdst']}] = ReadLane(lane, {a}, firstbitlow(s[126]));"]
+        return [f"s[{fields['vdst']}] = ReadLane(lane, {a}, firstbitlow(s[126] == 0u ? 1u : s[126]));"]
     if name in VECTOR_NO_OPERATION:
         return []
     if name in rdna2_exec_wide.OPERATIONS:
@@ -192,7 +192,7 @@ def _vop3(name, opcode, fields, literal, active=ACTIVE):
     if name == "v_readlane_b32":
         return [f"{scalar_target(fields.vdst)} = ReadLane(lane, {a}, {b});"]
     if name == "v_readfirstlane_b32":
-        return [f"{scalar_target(fields.vdst)} = ReadLane(lane, {a}, firstbitlow(s[126]));"]
+        return [f"{scalar_target(fields.vdst)} = ReadLane(lane, {a}, firstbitlow(s[126] == 0u ? 1u : s[126]));"]
     if name in VECTOR_NO_OPERATION:
         return []
     if name in MAD64:

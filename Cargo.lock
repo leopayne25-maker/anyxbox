@@ -340,6 +340,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyxboxx-rdna2-hlsl"
+version = "0.1.0"
+dependencies = [
+ "anyxboxx-rdna2-ref",
+]
+
+[[package]]
 name = "anyxboxx-rdna2-ref"
 version = "0.1.0"
 dependencies = [

@@ -75,7 +75,11 @@ def _buffer(name, word, active):
     byte_offset = f"({offset}u{f' + v[{vaddr}]' if offen else ''})"
     found = VECTOR_PATTERN.match(name)
     size = WIDTHS[found.group(3)] if found else 4
-    inside = f"({byte_offset} + {size}u <= s[{resource + 2}])"
+    # A structured descriptor bounds the index (zero here), not the byte offset. For a raw
+    # descriptor, subtract before comparing so a large offset cannot wrap the bounds check.
+    no_overflow = f"v[{vaddr}] <= 0xFFFFFFFFu - {offset}u && " if offen else ""
+    inside = (f"(((s[{resource + 1}] >> 16) & 0x3FFFu) != 0u ? s[{resource + 2}] != 0u : "
+              f"({no_overflow}{byte_offset} <= s[{resource + 2}] && {size}u <= s[{resource + 2}] - {byte_offset}))")
     address = f"(s[{resource}]{extra} + {byte_offset})"
     return _vector_access(name, address, vdata, vdata, active, glc=(word >> 14) & 1, inside=inside)
 

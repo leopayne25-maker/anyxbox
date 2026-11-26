@@ -1,0 +1,13 @@
+﻿[package]
+name = "anyxboxx-rdna2-hlsl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyxboxx-rdna2-ref = { path = "../anyxboxx-rdna2-ref" }
+
+[lints]
+workspace = true
