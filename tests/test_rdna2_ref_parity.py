@@ -209,6 +209,24 @@ def test_inline_double_constants_match_the_python_model():
             assert_same(exe, lanes, False, [], program(vopc("v_cmp_eq_f64", source, 0)))
 
 
+def test_signed_64_bit_sources_sign_extend_a_literal_in_both_models():
+    """ISA section 6.2.1 (p. 43): a 32-bit literal is sign-extended for a signed 64-bit source (s_ashr_i64,
+    s_bfe_i64, s_flbit_i32_i64) and zero-extended for the unsigned and bitwise ones."""
+    exe = binary()
+    control = [(60, 40 << 16 | 4)]                                   # s_bfe: offset 4, width 40
+    for value in (0x8000_0000, 0xFFFF_FFF0, 0xFACE_5766, 0x7FFF_FFFF, 0):
+        for words in (
+            program(sop2("s_ashr_i64", 40, LITERAL, 129), value), program(sop2("s_ashr_i64", 40, LITERAL, 132), value),
+            program(sop2("s_bfe_i64", 44, LITERAL, 60), value), program(sop2("s_bfe_u64", 46, LITERAL, 60), value),
+            program(sop1("s_flbit_i32_i64", 51, LITERAL), value), program(sop1("s_flbit_i32_b64", 52, LITERAL), value),
+            program(sop1("s_mov_b64", 48, LITERAL), value),
+        ):
+            assert_same(exe, 32, False, control, words)
+    # The values themselves, so that two models wrong in the same way cannot pass.
+    assert "s 51 0000003C\n" in run_python(32, False, [], program(sop1("s_flbit_i32_i64", 51, LITERAL), 0xFFFF_FFF0))
+    assert "s 52 00000020\n" in run_python(32, False, [], program(sop1("s_flbit_i32_b64", 52, LITERAL), 0xFFFF_FFF0))
+
+
 def test_scalar_packs_match_the_python_model():
     exe = binary()
     for name in ("s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"):
