@@ -199,7 +199,8 @@ def _bpermute(word):
     offset = (word >> 8 & 0xFF) << 8 | word & 0xFF
     addr, data0, vdst = (word >> 32) & 0xFF, (word >> 40) & 0xFF, (word >> 56) & 0xFF
     other = f"(lane & 32u) | (((v[{addr}] + {offset}u) >> 2) & 31u)"
-    return [f"{{ uint value = ReadLane64(lane, v[{data0}], {other}); if ({ACTIVE}) v[{vdst}] = value; }}"]
+    source_value = f"{ACTIVE} ? v[{data0}] : 0u"
+    return [f"{{ uint value = ReadLane64(lane, {source_value}, {other}); if ({ACTIVE}) v[{vdst}] = value; }}"]
 
 
 def _specific(data, instruction, name):

@@ -164,6 +164,27 @@ def test_vccnz_loop_runs_until_every_lane_is_done():
 
 
 @gpu
+def test_bpermute_masks_inactive_sources_in_each_wave64_half():
+    low, high = 0x33333333, 0xCCCCCCCC
+    expected, actual = compare(with_lane_offset(
+        vop2("v_add_nc_u32", 1, const(1), 0),                    # nonzero source in every lane
+        vop1("v_mov_b32", 2, MINUS_ONE),                         # sentinel in inactive destinations
+        sop1("s_mov_b32", EXEC_LO, 255), low,
+        sop1("s_mov_b32", EXEC_HI, 255), high,
+        *ds("ds_bpermute_b32", addr=31, data0=1, vdst=2, offset0=4),
+        sop1("s_mov_b64", EXEC_LO, MINUS_ONE),
+        *store_lane(2, 0)))
+    # Each active lane reads its next neighbour within the same 32-lane half.
+    # Lane 63 wraps to inactive lane 32. Inactive destinations keep the sentinel.
+    lanes = output(expected, 0)
+    for base in range(0, 32, 4):
+        assert lanes[base:base + 4] == [base + 2, 0, 0xFFFFFFFF, 0xFFFFFFFF]
+        assert lanes[32 + base:36 + base] == [0xFFFFFFFF, 0xFFFFFFFF, 36 + base, 0]
+    assert output(actual, 0) == lanes
+    assert actual == expected
+
+
+@gpu
 def test_lane_reads_writes_ids_and_bpermute_match():
     expected, actual = compare(with_lane_offset(
         *global_("global_load_dword", addr=31, vdst=1, saddr=0),
