@@ -128,7 +128,7 @@ def binary():
 
 
 def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=True, precompile_inputs=False,
-           archives=("A.rpf", "b.rpf")):
+           archives=("A.rpf", "b.rpf"), inherited=()):
     """Runs `anyxboxx run` in a fake repository; returns (process, calls with <root> for tmp_path)."""
     manifest = tmp_path / "depot" / "third_party" / "victory" / "Cargo.toml"
     manifest.parent.mkdir(parents=True)
@@ -152,6 +152,7 @@ def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=Tr
     shutil.copy(fake_tool, tmp_path / "prebuilt" / "prebuilt.exe")
     log = tmp_path / "calls.log"
     env = {k: v for k, v in os.environ.items() if not k.startswith("VICTORY_")}
+    env.update(inherited)
     env.update({"PATH": f"{tmp_path / 'tools'}{os.pathsep}{os.environ['PATH']}",
                 "CARGO_TARGET_DIR": str(tmp_path / "target"), "FAKE_TOOL_LOG": str(log),
                 "FAKE_TOOL_EXIT_CARGO": str(cargo_exit), "FAKE_TOOL_EXIT_VICTORY_RUN": str(VICTORY_EXIT),
@@ -195,6 +196,18 @@ def test_override_wins_over_quality_and_the_tuned_set(tmp_path, fake_tool, binar
     assert "VICTORY_RELAY=0" in logged and "VICTORY_RELAY=2" not in logged, done.stderr
 
 
+def test_overrides_apply_to_shaders_and_run_after_all_switches(tmp_path, fake_tool, binary):
+    options = ["--warm", "--no-tuned-settings", "--auto-a", "--batch-card-rehash",
+               "--override", "VICTORY_KEYS=8:Enter", "--override", "VICTORY_CARD_REHASH_RUNS=",
+               "--override", "VICTORY_D3D12_DRED="]
+    inherited = (("VICTORY_D3D12_DRED", "1"), ("VICTORY_CARD_REHASH_RUNS", "parent"))
+    done, calls = launch(tmp_path, fake_tool, binary, options, inherited=inherited)
+    env = ";".join(sorted((GAME_DIR, "VICTORY_KEYS=8:Enter")))
+    assert calls == [BUILD + "VICTORY_CARD_REHASH_RUNS=parent;VICTORY_D3D12_DRED=1",
+                     WARM_ARCHIVES + env, GAME + env], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
 def test_auto_a_is_a_key_script_when_asked(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--auto-a"])
     keys = next(v for v in calls[1].split(" | ", 1)[1].split(";") if v.startswith("VICTORY_KEYS="))
@@ -217,6 +230,18 @@ def test_the_xg_library_option_is_gone(tmp_path, fake_tool, binary):
     # Nothing in this VIctory base reads VICTORY_XG_DLL: the option is refused, nothing runs.
     done, calls = launch(tmp_path, fake_tool, binary, ["--xg-dll", "{xg}"])
     assert calls == [] and done.returncode != 0
+
+
+def test_skip_pipelines_keeps_the_release_build(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--skip-pipelines", "0123456789abcdef"])
+    assert calls == [BUILD, GAME + default_env(("VICTORY_SKIP_PIPELINES=0123456789abcdef",))], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
+def test_invalid_override_stops_before_building(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--override", "PATH=x"])
+    assert calls == [] and done.returncode != 0
+    assert "--override takes VICTORY_* names only" in done.stderr
 
 
 def test_warm_runs_the_game_archives_only_before_the_game(tmp_path, fake_tool, binary):
