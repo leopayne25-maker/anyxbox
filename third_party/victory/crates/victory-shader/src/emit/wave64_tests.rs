@@ -777,6 +777,11 @@ fn stores(regs: [u32; 4]) -> Vec<u32> {
 /// present. Where no other form gives the host the program (each still asks for 64-lane
 /// waves, or fails), it is also what [`super::emit`] gives it.
 fn paired(native: &NativeProgram) -> HostShader {
+    paired_and_emitted(native).0
+}
+
+/// The paired shader and the shader selected by `emit` on a 32-lane host.
+fn paired_and_emitted(native: &NativeProgram) -> (HostShader, HostShader) {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
@@ -789,15 +794,16 @@ fn paired(native: &NativeProgram) -> HostShader {
     let chosen = super::emit(&c, native, &p, &st, &io, &res);
     lower::TEST_HOST_WAVE.set(was);
     let (shader, wave) = shader.expect("the paired form");
+    let chosen = chosen.expect("emit");
     assert_eq!(wave, Some(32));
     if !matches!(others, Ok((_, wave)) if wave != Some(64)) {
-        assert_eq!(chosen.expect("emit").dxil, shader.dxil, "emit's choice");
+        assert_eq!(chosen.dxil, shader.dxil, "emit's choice");
     }
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
     }
-    shader
+    (shader, chosen)
 }
 
 /// `shader` on the hardware device: one group, root constants `s0..s3`, a raw UAV of `dwords`
@@ -979,7 +985,30 @@ fn paired_lanes_loop_apart_and_meet_the_other_wave_at_the_barrier() {
     eprintln!("ran on the hardware device: two console waves, their loops and LDS as on the console");
 }
 
-/// One console wave: `ds_bpermute_b32` from the mirror lane; a DPP row shift whose row mask
+#[test]
+fn bpermute_wave64_stays_in_each_half() {
+    let mut w = vec![vop1(0x01, 1, 0)]; // v_mov_b32 v1, s0 (byte address)
+    w.extend(ds(0xB3, 2, 1, 0, 4)); // ds_bpermute_b32 v2, v1, v0 offset:4
+    w.extend(stores([2, 0, 0, 0]));
+    let (paired, emitted) = paired_and_emitted(&native_with(&w, true, 64, 0));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (form, shader) in [("runtime", &emitted), ("paired", &paired)] {
+        for address in [0u32, 120, 124] {
+            let Some(got) = run_paired(shader, [address, 0, 0, 0], 256) else { return };
+            let index = ((address + 4) >> 2) & 31;
+            let expected: Vec<u32> = (0..64)
+                .flat_map(|lane| [(lane & 32) | index, lane, lane, lane])
+                .collect();
+            eprintln!(
+                "{form}, address {address}: lane 0 read {}, lane 32 read {}",
+                got[0], got[128]
+            );
+            same_as_console(&got, &expected);
+        }
+    }
+}
+
+/// One console wave: `ds_bpermute_b32` from the mirror lane in each half; a DPP row shift whose row mask
 /// leaves rows 0 and 3 alone (rows 2 and 3 are lanes 32-63: rows are counted in console lanes); a
 /// `ds_swizzle_b32` swapping the two 16-lane rows of each 32 lanes; `v_writelane_b32` of s0
 /// into lane 45.
@@ -1009,7 +1038,7 @@ fn paired_lanes_permute_shift_and_write_lanes_of_both_halves() {
         .flat_map(|n| {
             let shifted = if matches!(n >> 4, 1 | 2) && n & 15 != 0 { x(n - 1) } else { 1000 };
             let swizzled = x(n & 32 | (n & 31) ^ 16);
-            [x(63 - n), shifted, swizzled, if n == 45 { s0 } else { n }]
+            [x(n ^ 31), shifted, swizzled, if n == 45 { s0 } else { n }]
         })
         .collect();
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());

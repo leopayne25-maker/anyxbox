@@ -1170,19 +1170,16 @@ impl<'a> Lower<'a> {
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
-            // exactly in waves of 32: the thread relabelling makes each host wave one half of a
-            // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
-            // masks), nor when LDS may be shared within the console wave without barriers (a
-            // group over 32 threads with LDS): those still need 64-lane waves.
+            // `ds_swizzle`, `ds_bpermute`, `v_permlane16` / `v_permlanex16` – runs
+            // exactly in waves of 32. Thread relabelling makes each host wave one half of a
+            // console wave (lanes 32k..32k+31). Whole-wave operations, lane masks read as data,
+            // and LDS shared across the halves require the whole-wave lowering paths.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1242,8 +1239,8 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
+                        } else if n.starts_with("ds_permute") {
+                            "ds_permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -4585,29 +4582,29 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if name == "ds_bpermute_b32" {
-            // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
-            // neighbours' samples with it; without them every shadowed light
-            // was multiplied by an empty mask.)
+            // Backward permute indexes dwords within the caller's 32-lane
+            // half (RDNA 2 ISA section 10.4.4). A source outside EXEC gives 0.
             // shortcut: a source lane that is not at this instruction on the
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
+            let last = self.s.m.i32(31);
             let src = self.s.m.bin(c, Bin::And, src, last);
+            // A split or paired wave already uses host lanes 0..31 for each half.
+            let src = if self.x.native.wave64 && self.s.wave_size != Some(32) {
+                let me = self.lane_index();
+                let not31 = self.s.m.i32(!31);
+                let base = self.s.m.bin(c, Bin::And, me, not31);
+                self.s.m.bin(c, Bin::Or, base, src)
+            } else {
+                src
+            };
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
@@ -5052,7 +5049,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let cross = match name {
-            "v_readlane_b32" | "ds_bpermute_b32" => true,
+            "v_readlane_b32" => true,
             // (not a waterfall loop's read, the lane's own dword: `Self::valu`)
             "v_readfirstlane_b32" => {
                 !inst.writes.first().is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1))
@@ -5100,26 +5097,21 @@ impl<'a> Lower<'a> {
 
     /// The paired form: an instruction that reads other lanes of the console wave, any of its
     /// 64: `v_readlane_b32` and `v_readfirstlane_b32` (scalar results, the same in both lanes of
-    /// the thread) and `ds_bpermute_b32`. Lane n and lane n + 32 are the lower and the upper
-    /// lane of host lane n.
+    /// the thread). Lane n and lane n + 32 are the lower and the upper lane of host lane n.
     fn paired_cross(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.cross_lane(false)?;
         let c = self.cur;
-        let (k31, k32, z) = (self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(0));
-        // a lane's value from the lower or upper value of the host lane `at` (of 0..63)
-        let pick = |l: &mut Self, lo: V, hi: V, at: V| {
-            let host = l.s.m.bin(c, Bin::And, at, k31);
-            let upper = l.s.m.bin(c, Bin::And, at, k32);
-            let upper = l.s.m.cmp(c, pred::NE, upper, z);
-            let (lo, hi) = (l.read_lane(lo, host), l.read_lane(hi, host));
-            l.s.m.select(c, upper, hi, lo)
-        };
         match inst.name() {
             "v_readlane_b32" => {
                 // the lane: a scalar or a constant
                 let lane = self.src(inst, 1)?;
                 let [lo, hi] = self.both(|l| l.src(inst, 0))?;
-                let r = pick(self, lo, hi, lane);
+                let (k31, k32, z) = (self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(0));
+                let host = self.s.m.bin(c, Bin::And, lane, k31);
+                let upper = self.s.m.bin(c, Bin::And, lane, k32);
+                let upper = self.s.m.cmp(c, pred::NE, upper, z);
+                let (lo, hi) = (self.read_lane(lo, host), self.read_lane(hi, host));
+                let r = self.s.m.select(c, upper, hi, lo);
                 self.write_i(inst, r, None)?;
             }
             "v_readfirstlane_b32" => {
@@ -5133,45 +5125,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, in_lo, lo, hi);
                 self.write_i(inst, r, None)?;
             }
-            _ => {
-                // `ds_bpermute_b32`: each lane reads the lane its address names, which gives
-                // its data, or 0 outside EXEC
-                let Fields::Ds {
-                    dst: Some(Operand::Vector { reg, .. }),
-                    addr: Some(addr),
-                    data,
-                    offset0,
-                    offset1,
-                    ..
-                } = &inst.fields
-                else {
-                    return Err("a permute's operands");
-                };
-                let data = data.first().ok_or("a permute source")?;
-                let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
-                let [(from_lo, x_lo, g_lo), (from_hi, x_hi, g_hi)] = self.both(|l| {
-                    let at = l.vgprs(inst, addr, 1)?[0];
-                    let x = l.vgprs(inst, data, 1)?[0];
-                    let guard = l.guard(b, i)?;
-                    let (o, two) = (l.s.m.i32(offset), l.s.m.i32(2));
-                    let at = l.s.m.bin(c, Bin::Add, at, o);
-                    let from = l.s.m.bin(c, Bin::LShr, at, two);
-                    let x = match guard {
-                        Some(g) => l.s.m.select(c, g, x, z),
-                        None => x,
-                    };
-                    Ok((from, x, guard))
-                })?;
-                let read = [pick(self, x_lo, x_hi, from_lo), pick(self, x_lo, x_hi, from_hi)];
-                let guards = [g_lo, g_hi];
-                let reg = *reg;
-                self.both(|l| {
-                    let n = usize::from(l.upper);
-                    l.write(inst, Reg::V(reg), read[n], guards[n]);
-                    Ok(())
-                })?;
-                return Ok(());
-            }
+            _ => unreachable!(),
         }
         self.mirror(inst);
         Ok(())
