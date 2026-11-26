@@ -197,6 +197,7 @@ def test_override_wins_over_quality_and_the_tuned_set(tmp_path, fake_tool, binar
 
 def test_auto_a_is_a_key_script_when_asked(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--auto-a"])
+    assert calls[0] == BUILD, done.stderr
     keys = next(v for v in calls[1].split(" | ", 1)[1].split(";") if v.startswith("VICTORY_KEYS="))
     assert keys.startswith("VICTORY_KEYS=4:Enter,8:Enter,") and keys.endswith(",148:Enter"), done.stderr
 
