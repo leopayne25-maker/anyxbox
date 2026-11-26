@@ -82,6 +82,23 @@ Measured on Linux only, with this code (built as `890a83a` before the copy, same
 - Indoor and shadowed areas are black: ray tracing does not run (the structure builder is off and the run skips the ray-traced, GI and reflection passes). Observed.
 - Earlier, on stock Proton, batch 6 ran at a 685 ms median world frame; with the wineserver patch and the write-watch cuts of this branch, run 14 (a local batch that already carried most of these commits) ran at 274 ms. Measured.
 
+### The view-tree wineserver patch (Linux)
+
+The "community view-tree wineserver patch" above is [CachyOS/wine-cachyos#50](https://github.com/CachyOS/wine-cachyos/pull/50) (Wine bug [60868](https://bugs.winehq.org/show_bug.cgi?id=60868)), by ajsem1337 from a version by neonbyte1, discussed in Marvisak/VIctory#340 and #834. wineserver keeps each process's mapped views in a list and walks it on every map, unmap and address check; VIctory keeps tens of thousands of views alive in the world, and Wine's process-wide virtual memory lock is held across those server calls, so every `VirtualProtect`, write-watch query and guard fault on other threads waits too. The patch adds a tree keyed by view base. Only `wineserver` changes, and it must match the Proton it runs with (same server protocol).
+
+`tools/build_ge_wineserver.sh <GE tag> <installed GE-Proton folder> <empty work folder>` builds it for a GE-Proton release: it fetches that tag of proton-ge-custom and the Wine and wine-staging commits it pins, applies GE's Wine patches (the Wine section of its `protonprep-valve-staging.sh`), applies the patch, builds only `server/wineserver`, checks its protocol version against the installed Proton's `ntdll.so`, and makes a copy of the Proton folder with only `files/bin/wineserver` replaced. About 75 s on a 16-core CPU; needs git, a C toolchain, autoconf, flex, bison, perl and python3. Launch with that copy (`proton runinprefix ...`), and make sure no stock wineserver is still alive for the prefix: a new launch joins the running one.
+
+Measured with GE-Proton11-14 (protocol 938) on CachyOS, RX 9070 XT, Mesa 26.3.1, this repository's VIctory plus Marvisak/VIctory#454 (watchdog off), Wine's own `d3dcompiler_47` (so indirect draws were dropped in every run), same binary and prefix, only `wineserver` swapped:
+
+| | stock | view tree |
+| --- | ---: | ---: |
+| World reached (100+ draws a frame) | not after 600 s (still loading at ~187 ms a frame); an earlier stock run: ~270 s | 76 s and 104 s (two runs) |
+| Median world frame | 8442 ms (earlier stock run, 3 world lines) | 1061 ms (64 lines) and 1041 ms (50 lines) |
+| wineserver CPU | 146 s over the 600 s run | about 0.07 of a core in the world (`perf`, 20 s) |
+| `MapViewOfFile` + `UnmapViewOfFile` pair, with 0 / 5,000 / 20,000 / 50,000 other views mapped | 42 / 174 / 139 / 314 µs | 46 / 54 / 42 / 59 µs |
+
+Both view-tree runs ended after about 8 and 7 minutes on the title's own breakpoint ("Unsignaled CrossQueueBarrier" in its crash report); the stock run did not get that far, so whether the patch is involved is not known yet.
+
 Settings of that run (not set by the launcher; Linux only):
 
 | Variable | Value | Why |

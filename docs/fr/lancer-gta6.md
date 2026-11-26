@@ -82,6 +82,23 @@ Mesuré sous Linux seulement, avec ce code (compilé comme `890a83a` avant la co
 - Les intérieurs et les zones à l'ombre sont noirs : le ray tracing ne tourne pas (le constructeur de structures est coupé et le lancement saute les passes de ray tracing, de GI et de reflets). Observé.
 - Avant, sur Proton sans correctif, le lot 6 tournait à 685 ms d'image médiane ; avec le correctif du wineserver et les réductions de write-watch de cette branche, le lancement 14 (un lot local qui portait déjà la plupart de ces commits) tournait à 274 ms. Mesuré.
 
+### Le correctif « view-tree » du wineserver (Linux)
+
+Le « correctif communautaire view-tree du wineserver » cité plus haut est [CachyOS/wine-cachyos#50](https://github.com/CachyOS/wine-cachyos/pull/50) (bogue Wine [60868](https://bugs.winehq.org/show_bug.cgi?id=60868)), d'ajsem1337 à partir d'une version de neonbyte1, discuté dans Marvisak/VIctory#340 et #834. Le wineserver garde les vues projetées de chaque processus dans une liste et la parcourt à chaque projection, retrait et vérification d'adresse ; VIctory garde des dizaines de milliers de vues dans le monde, et le verrou de mémoire virtuelle de Wine, commun à tout le processus, reste pris pendant ces appels au serveur : chaque `VirtualProtect`, chaque question de write-watch et chaque faute de garde des autres fils attend aussi. Le correctif ajoute un arbre trié par adresse de base des vues. Seul `wineserver` change, et il doit correspondre au Proton avec lequel il tourne (même protocole du serveur).
+
+`tools/build_ge_wineserver.sh <tag GE> <dossier GE-Proton installé> <dossier de travail vide>` le construit pour une version de GE-Proton : il récupère ce tag de proton-ge-custom et les commits de Wine et de wine-staging qu'il épingle, applique les correctifs Wine de GE (la section Wine de son `protonprep-valve-staging.sh`), applique le correctif, ne compile que `server/wineserver`, vérifie sa version de protocole contre le `ntdll.so` du Proton installé, et fait une copie du dossier Proton où seul `files/bin/wineserver` est remplacé. Environ 75 s sur un processeur de 16 cœurs ; il faut git, une chaîne de compilation C, autoconf, flex, bison, perl et python3. Lancer avec cette copie (`proton runinprefix ...`), et vérifier qu'aucun wineserver d'origine ne tourne encore pour le préfixe : un nouveau lancement rejoint celui qui tourne.
+
+Mesuré avec GE-Proton11-14 (protocole 938) sous CachyOS, RX 9070 XT, Mesa 26.3.1, le VIctory de ce dépôt plus Marvisak/VIctory#454 (chien de garde coupé), le `d3dcompiler_47` de Wine (les dessins indirects étaient donc abandonnés dans tous les lancements), même binaire et même préfixe, seul `wineserver` changé :
+
+| | d'origine | view tree |
+| --- | ---: | ---: |
+| Monde atteint (100 dessins ou plus par image) | pas après 600 s (encore en chargement, ~187 ms par image) ; un lancement d'origine précédent : ~270 s | 76 s et 104 s (deux lancements) |
+| Image médiane du monde | 8442 ms (lancement d'origine précédent, 3 lignes du monde) | 1061 ms (64 lignes) et 1041 ms (50 lignes) |
+| Processeur du wineserver | 146 s sur les 600 s du lancement | environ 0,07 cœur dans le monde (`perf`, 20 s) |
+| Paire `MapViewOfFile` + `UnmapViewOfFile`, avec 0 / 5 000 / 20 000 / 50 000 autres vues projetées | 42 / 174 / 139 / 314 µs | 46 / 54 / 42 / 59 µs |
+
+Les deux lancements avec le view tree se sont arrêtés après environ 8 et 7 minutes sur le point d'arrêt du titre lui-même (« Unsignaled CrossQueueBarrier » dans son rapport de plantage) ; le lancement d'origine n'est pas allé aussi loin, on ne sait donc pas encore si le correctif y est pour quelque chose.
+
 Réglages de ce lancement (non posés par le lanceur ; Linux seulement) :
 
 | Variable | Valeur | Pourquoi |
