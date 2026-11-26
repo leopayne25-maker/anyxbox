@@ -9,6 +9,7 @@
 // cherché à côté de anyxboxx.exe.
 #include <windows.h>
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -33,8 +34,33 @@ struct Game {
 
 Game g_game;
 
+// Write UTF-8 to stderr in fixed stack chunks (safe in ReportFirstException: no heap allocation).
+void WriteStderrText(const wchar_t* text) {
+  while (*text != L'\0') {
+    size_t count = 0;
+    while (count < 255 && text[count] != L'\0') ++count;
+    if (count == 255 && text[count - 1] >= 0xD800 && text[count - 1] <= 0xDBFF && text[count] != L'\0') {
+      --count;  // keep a UTF-16 surrogate pair together
+    }
+    char utf8[1024];
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(count), utf8, sizeof utf8, nullptr, nullptr);
+    if (bytes > 0) std::fwrite(utf8, 1, static_cast<size_t>(bytes), stderr);
+    text += count;
+  }
+  std::fflush(stderr);
+}
+
+void WriteStderr(const wchar_t* format, ...) {
+  wchar_t buffer[1024] = {};
+  va_list arguments;
+  va_start(arguments, format);
+  _vsnwprintf_s(buffer, _TRUNCATE, format, arguments);
+  va_end(arguments);
+  WriteStderrText(buffer);
+}
+
 int Fail(const wchar_t* message, DWORD error = GetLastError()) {
-  fwprintf(stderr, L"[anyxboxx] %ls (erreur %lu)\n", message, error);
+  WriteStderr(L"[anyxboxx] %ls (erreur %lu)\n", message, error);
   return 1;
 }
 
@@ -312,7 +338,9 @@ int BindImports() {
     }
   }
   if (!missing.empty()) {
-    fwprintf(stderr, L"[anyxboxx] imports introuvables :%ls\n", missing.c_str());
+    WriteStderrText(L"[anyxboxx] imports introuvables :");
+    WriteStderrText(missing.c_str());
+    WriteStderrText(L"\n");
     return 1;
   }
   return 0;
@@ -387,9 +415,8 @@ LONG WINAPI ReportFirstException(EXCEPTION_POINTERS* pointers) {
   for (const wchar_t* c = path; *c != L'\0'; ++c) {
     if (*c == L'\\' || *c == L'/') name = c + 1;
   }
-  fwprintf(stderr, L"[anyxboxx] première exception 0x%08lX : %ls+0x%llX\n", code, name,
-           static_cast<unsigned long long>(address - start));
-  fflush(stderr);
+  WriteStderr(L"[anyxboxx] première exception 0x%08lX : %ls+0x%llX\n", code, name,
+              static_cast<unsigned long long>(address - start));
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -419,7 +446,7 @@ std::wstring ResolveTarget(const std::wstring& target) {
 
 int wmain(int argc, wchar_t** argv) {
   if (argc < 2) {
-    fwprintf(stderr, L"Usage : anyxboxx.exe <jeu.exe | dossier du paquet> [--fps]\n");
+    WriteStderr(L"Usage : anyxboxx.exe <jeu.exe | dossier du paquet> [--fps]\n");
     return 1;
   }
   for (int i = 2; i < argc; ++i) {
@@ -432,9 +459,9 @@ int wmain(int argc, wchar_t** argv) {
   g_game.folder = g_game.path.substr(0, g_game.path.find_last_of(L"\\/"));
   if (GetFileAttributesW(full) == INVALID_FILE_ATTRIBUTES) {
     // Paquet incomplet : le code du jeu manque, rien ne peut le remplacer.
-    fwprintf(stderr, L"[anyxboxx] exécutable du jeu absent : %ls\n", full);
-    fwprintf(stderr, L"[anyxboxx] le paquet ne contient que les données et les DLL ; "
-                     L"le code du jeu est dans cet exécutable.\n");
+    WriteStderr(L"[anyxboxx] exécutable du jeu absent : %ls\n", full);
+    WriteStderr(L"[anyxboxx] le paquet ne contient que les données et les DLL ; "
+                L"le code du jeu est dans cet exécutable.\n");
     return 1;
   }
   wchar_t value[8] = {};

@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="exécution nati
 
 def launch(runtime_dir, target):
     return subprocess.run([str(runtime_dir / "anyxboxx.exe"), str(target)], capture_output=True, text=True,
-                          timeout=30)
+                          encoding="utf-8", timeout=30)
 
 
 def test_entry_point_result_is_the_exit_code(tmp_path, runtime_dir):
@@ -103,9 +103,8 @@ def test_package_without_its_executable_says_so(tmp_path, runtime_dir):
     (tmp_path / "MicrosoftGame.config").write_text(
         '<Game><ExecutableList><Executable Name="game_scarlett_master.exe" /></ExecutableList></Game>',
         encoding="utf-8")
-    result = subprocess.run([str(runtime_dir / "anyxboxx.exe"), str(tmp_path)], capture_output=True, timeout=30)
-    stderr = result.stderr.decode("utf-8", errors="replace") + result.stderr.decode("mbcs", errors="replace")
-    assert result.returncode == 1 and "game_scarlett_master.exe" in stderr
+    result = launch(runtime_dir, tmp_path)
+    assert result.returncode == 1 and "game_scarlett_master.exe" in result.stderr and "exécutable" in result.stderr
 
 
 SEM_NOGPFAULTERRORBOX = 0x0002
@@ -126,7 +125,7 @@ def test_first_exception_names_the_module_and_rva(tmp_path, runtime_dir):
     exe = build_pe(tmp_path / "trap.exe", lambda iat: Asm().mov_eax(1).raw(b"\xcc").ret().build(), dll=False)
     result = launch_without_crash_window(runtime_dir, exe)          # int3 à la RVA 0x1005, après mov eax, 1
     assert result.returncode & 0xFFFF_FFFF == 0x8000_0003
-    assert "0x80000003" in result.stderr and "trap.exe+0x1005" in result.stderr
+    assert "première exception 0x80000003" in result.stderr and "trap.exe+0x1005" in result.stderr
 
 
 # W13 (first-boot-1021.md) : le titre importe GameInput.dll!#1, le GameInputCreate v0 du GameInput.lib
