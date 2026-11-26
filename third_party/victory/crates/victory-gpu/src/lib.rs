@@ -25,6 +25,8 @@ pub mod device;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod background;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]

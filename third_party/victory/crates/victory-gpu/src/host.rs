@@ -713,7 +713,15 @@ fn create() -> windows::core::Result<Host> {
                 None,
                 None,
             );
-            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
+            match set {
+                Ok(()) => tracing::info!("the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)"),
+                // (Neptune) Refused without Windows' Developer Mode: its threads go to idle
+                // priority instead (`crate::background`).
+                Err(e) => {
+                    tracing::info!(error = %e, "the host refused to switch its background shader work off (VICTORY_D3D12_BACKGROUND=0): its threads go to idle priority");
+                    crate::background::watch();
+                }
+            }
         }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
