@@ -56,7 +56,7 @@ pub struct RunArgs {
     /// Picture first: windows and buffers read fresh each frame (not measured on this VIctory base).
     #[arg(long, alias = "Quality")]
     pub quality: bool,
-    /// KEY=VALUE VICTORY_* variables set after the tuned set and --quality, for A/B runs. Repeatable.
+    /// Override any VICTORY_* launch setting with KEY=VALUE. Repeatable. Use KEY= to unset it.
     #[arg(long = "override", alias = "Override", value_parser = parse_override)]
     pub overrides: Vec<(String, String)>,
     /// Taps Enter (also the first pad's A) every 4 s through the start screens for 150 s (VICTORY_KEYS).
@@ -125,6 +125,7 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
         (None, Some(repo)) => Victory::locate(repo, args.uses_diag())?,
         (None, None) => return Err(RunError::NoRepo),
     };
+    let env = environment(args)?;
     game_exe(&args.game_dir)?;
     if let Some(mut build) = victory.build_command() {
         let profile = if args.uses_diag() {
@@ -138,7 +139,6 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
             return Err(RunError::BuildFailed(code));
         }
     }
-    let env = environment(args)?;
     if args.warm {
         let archives = warm_archives(&args.game_dir)?;
         println!(

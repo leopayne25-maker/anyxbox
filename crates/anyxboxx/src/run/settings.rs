@@ -110,8 +110,7 @@ fn pairs(
         .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
 }
 
-/// The game's environment, in order: the game folder, the profile, `--quality`, `--override`, then
-/// the opt-in switches.
+/// The game directory, selected profile and dedicated switches, before explicit overrides.
 pub fn base(args: &RunArgs) -> Vec<(String, OsString)> {
     let mut env = vec![(GAME_DIR.to_string(), args.game_dir.clone().into_os_string())];
     if !args.no_tuned_settings {
@@ -123,9 +122,6 @@ pub fn base(args: &RunArgs) -> Vec<(String, OsString)> {
     }
     if args.quality {
         env.extend(pairs(QUALITY));
-    }
-    for (name, value) in &args.overrides {
-        env.push((name.clone(), OsString::from(value)));
     }
     if args.auto_a {
         env.push((KEYS.to_string(), OsString::from(auto_a_keys())));
