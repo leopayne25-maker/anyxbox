@@ -26,6 +26,8 @@ use crate::object::This;
 pub(crate) mod prepare;
 #[cfg(test)]
 mod zero_upload_tests;
+#[cfg(all(test, windows))]
+mod read_marks_tests;
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -687,10 +689,13 @@ pub(crate) fn let_go_idle() {
             // A list that recorded an upload or a check holds the staging until it
             // is reset: one only the table holds is named by no list, recorded or
             // running.
-            map.retain(|_, s| {
+            map.retain(|&resource, s| {
                 let keep = Arc::strong_count(s) > 1
                     || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
                 if !keep {
+                    // (A live texture: one the title releases leaves the
+                    // table first, under this lock.)
+                    crate::resource::set_staged_first(resource as This, u32::MAX);
                     LET_GO[0].fetch_add(1, Relaxed);
                     LET_GO[1].fetch_add(s.bytes, Relaxed);
                     went += 1;
@@ -724,6 +729,7 @@ pub(crate) fn host_written(resource: This) {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
+    crate::resource::mark_host_written(resource);
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
@@ -833,14 +839,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// placed texture the title may have no memory for the larger ones, and
 /// what lies there is another texture's.
 pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
+    // (Both asked of the texture itself, not of the shared tables: every
+    // read of every texture by every recording thread asked them.)
+    let host_written = crate::resource::host_written_mark(resource);
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) && staged_from(resource) <= first {
+    if host_written || !list.first_use(resource as usize) && crate::resource::staged_first(resource) <= first {
         return;
     }
     let Some(staging) = staging(resource, texture, first) else {
@@ -1495,8 +1499,10 @@ impl Staging {
 /// anew.
 pub(crate) fn unstage(resource: This) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
+    if let Some(map) = map.as_mut()
+        && map.remove(&(resource as usize)).is_some()
+    {
+        crate::resource::set_staged_first(resource, u32::MAX);
     }
 }
 
@@ -1604,7 +1610,8 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 
 /// The first mip a title texture's staging buffer holds; `u32::MAX` without
 /// one.
-fn staged_from(resource: This) -> u32 {
+#[cfg(test)]
+pub(crate) fn staged_from(resource: This) -> u32 {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .and_then(|map| map.get(&(resource as usize)))
@@ -1809,10 +1816,12 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     // it is (`VICTORY_TEXTURE_PREPARE_THREADS`; none without).
     if let Some(s) = prepare::take_ready(resource, first, on_demand) {
         map.insert(resource as usize, s.clone());
+        crate::resource::set_staged_first(resource, s.first);
         return Some(s);
     }
     let s = build_staging(resource, texture, first, on_demand)?;
     map.insert(resource as usize, s.clone());
+    crate::resource::set_staged_first(resource, s.first);
     Some(s)
 }
 
