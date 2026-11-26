@@ -2123,6 +2123,9 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    // The table of all textures is let go first: `slot_evict` takes it again, and a second
+    // lock of it on this thread waits for itself for good (`VICTORY_SLOT_EVICT=1`).
+    drop(all);
     slot_evict(video, idle_ms, IDLE_FRAMES);
     if went > 0 {
         crate::host::trail(|| {
