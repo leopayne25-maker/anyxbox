@@ -238,7 +238,8 @@ def statements(data, instruction, finish="return;", special=None, active=ACTIVE)
         if name in rdna2_hlsl_pc.NAMES:
             return rdna2_hlsl_pc.statements(name, _fields(family, first), instruction)
         if name in rdna2_hlsl_scalar64.SCALAR64:
-            return [rdna2_hlsl_scalar64.statement(name, _fields(family, first))]
+            line = rdna2_hlsl_scalar64.statement(name, _fields(family, first), _literal(data, instruction, 1))
+            return [line] if line else []
         if name not in SCALAR:
             raise Untranslatable(f"non traduite en HLSL : {name}")
         line = scalar_statement(name, _fields(family, first), _literal(data, instruction, 1))
@@ -287,9 +288,10 @@ def translate(data, sgprs=None, wave_size=32):
     if wave_size == 64:
         from emu import rdna2_hlsl_wave64
         return rdna2_hlsl_wave64.translate(data, sgprs)
-    helpers = "\n".join((ALU_HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPERS, rdna2_hlsl_image.HELPERS,
-                         rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS, rdna2_hlsl_sad.HELPERS,
-                         rdna2_hlsl_f16.HELPERS, rdna2_hlsl_cmpf16.HELPERS, rdna2_hlsl_int16.HELPERS))
+    helpers = "\n".join((ALU_HELPERS, rdna2_hlsl_scalar64.HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPERS,
+                         rdna2_hlsl_image.HELPERS, rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS,
+                         rdna2_hlsl_sad.HELPERS, rdna2_hlsl_f16.HELPERS, rdna2_hlsl_cmpf16.HELPERS,
+                         rdna2_hlsl_int16.HELPERS))
     prelude = PRELUDE.replace("[numthreads", helpers + "\n[numthreads", 1)
     return "\n".join([prelude.rstrip("\n"), *body(data, sgprs), "}", ""])
 

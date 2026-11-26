@@ -5,12 +5,12 @@ lignes (ballot, readlane) se réduisent à la ligne elle-même. La LDS (DS) n'ex
 ces étages : une instruction DS lève Untranslatable, comme tout export non pris en charge.
 """
 from emu import (rdna2, rdna2_graphics as graphics, rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_f16, rdna2_hlsl_format,
-                 rdna2_hlsl_image, rdna2_hlsl_int16, rdna2_hlsl_sad, rdna2_hlsl_wide)
+                 rdna2_hlsl_image, rdna2_hlsl_int16, rdna2_hlsl_sad, rdna2_hlsl_scalar64, rdna2_hlsl_wide)
 from emu.rdna2_hlsl import body
 from emu.rdna2_hlsl_ops import HELPERS as ALU_HELPERS, Untranslatable
 
-HELPERS = "\n".join((ALU_HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPERS, rdna2_hlsl_image.HELPERS,
-                     rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS,
+HELPERS = "\n".join((ALU_HELPERS, rdna2_hlsl_scalar64.HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPERS,
+                     rdna2_hlsl_image.HELPERS, rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS,
                      rdna2_hlsl_sad.HELPERS, rdna2_hlsl_f16.HELPERS, rdna2_hlsl_int16.HELPERS))
 ACTIVE = "((s[126] >> lane) & 1u) != 0"
 FINISH = "pc = END_PC; break;"
