@@ -1032,12 +1032,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
-/// Device method.
+/// Device method. A null description clears the slot with a null CBV.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let [lo, hi, size, _] = words(desc).unwrap_or_default();
+    let address = u64::from(lo) | u64::from(hi) << 32;
+    record(handle, View::Constant(address, size));
 }
 
 /// Device method.
@@ -1392,6 +1391,23 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_null_cbv_overwrites_a_bound_slot_and_can_be_copied() {
+        let null = std::ptr::null();
+        let mut slots = [0u64; 8];
+        let source = slots.as_mut_ptr() as u64;
+        let dest = source + 32;
+        let desc = [0x1000, 1, 256, 0];
+        create_cbv(null, &desc, source);
+        create_cbv(null, &desc, dest);
+        assert_eq!(view(source), Some(View::Constant(0x1_0000_1000, 256)));
+
+        create_cbv(null, std::ptr::null(), source);
+        assert_eq!(view(source), Some(View::Constant(0, 0)));
+        copy_simple(null, 1, dest, source, VIEWS_KIND);
+        assert_eq!(view(dest), Some(View::Constant(0, 0)));
     }
 
     #[test]

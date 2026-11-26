@@ -3212,6 +3212,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
+        // A zero-sized CBV is unbound; the caller writes a typed null slot.
+        View::Constant(_, 0) => None,
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
@@ -3815,6 +3817,24 @@ mod tests {
         unsafe { host.device.CreateShaderResourceView(texture, None, heap.cpu(0)) };
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn a_null_cbv_does_not_need_a_host_buffer() {
+        let Some(host) = host() else { return };
+        // SAFETY: one slot for a constant-buffer descriptor on this device.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            }).unwrap();
+            let slot = heap.GetCPUDescriptorHandleForHeapStart();
+            let view = View::Constant(0, 0);
+            assert!(make(&view, slot).is_none());
+            null_for(&view, slot);
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
