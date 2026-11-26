@@ -1863,6 +1863,15 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     Some(s)
 }
 
+/// The first mip a title texture's staging buffer holds; `u32::MAX` without
+/// one.
+fn staged_from(resource: This) -> u32 {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        .map_or(u32::MAX, |s| s.first)
+}
+
 /// (Neptune) For a prepare thread (`prepare`): the staging state of title
 /// texture `resource` from mip `first` on, made as [`staging`] makes it but
 /// not put in the table (the pass that records its upload puts it there).
@@ -1914,6 +1923,9 @@ fn build_staging_untimed(resource: This, texture: &ID3D12Resource, first: u32, o
         return None;
     }
     let host = host()?;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let host_mips = u32::from(d.MipLevels);
     let base_mip = if on_demand {
         0
     } else {
