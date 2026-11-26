@@ -452,15 +452,6 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// The colour twin of title texture `this`, if it has one.
-#[cfg(windows)]
-pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
-    if this.is_null() {
-        return None;
-    }
-    hosted(this, true).and_then(|made| made.1)
-}
-
 /// The twin's texture, for the unordered access views of `this`.
 #[cfg(windows)]
 pub(crate) fn twin_resource<'a>(
@@ -1244,6 +1235,10 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// The host texture's resource flags (render target, depth, unordered
+    /// access, denied shader resource), read once: a texture's description
+    /// never changes, and every read of it asked the driver again.
+    pub(crate) flags: u32,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -2522,20 +2517,38 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
     }
 }
 
+/// A host texture's resource flags.
+#[cfg(windows)]
+fn host_flags(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    // SAFETY: a plain query on a live resource.
+    unsafe { texture.GetDesc() }.Flags.0 as u32
+}
+
 #[cfg(windows)]
 impl HostTexture {
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    pub(crate) fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
+            flags: host_flags(&texture),
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
             tiled: None,
         }
+    }
+
+    /// [`crate::host::legal_state`] of `state` for this texture.
+    pub(crate) fn legal(&self, state: u32) -> u32 {
+        crate::host::legal_for(self.flags, state)
+    }
+
+    /// [`crate::texture::title_written`] of this texture.
+    pub(crate) fn title_written(&self) -> bool {
+        crate::texture::title_written_flags(self.flags)
     }
 
     /// A texture made without memory of its own (`crate::tiles`): counted
@@ -2547,6 +2560,7 @@ impl HostTexture {
     ) -> HostTexture {
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
+            flags: host_flags(&texture),
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
@@ -2614,6 +2628,16 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, true).map(|made| made.0)
+}
+
+/// A title texture's host copy and colour twin from one lookup (each
+/// lookup takes the texture's lock), for a draw's read, which uses both.
+#[cfg(windows)]
+pub(crate) fn host_side(this: This) -> Option<Made> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, true)
 }
 
 /// A host texture like the title's: same description, in GPU memory,
