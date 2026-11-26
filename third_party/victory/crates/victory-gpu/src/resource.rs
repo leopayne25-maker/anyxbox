@@ -726,6 +726,27 @@ pub(crate) struct PlacedFootprint {
     row_pitch: u32,
 }
 
+/// The rows a texture-to-buffer copy wrote in the host and title footprints.
+#[cfg(windows)]
+pub(crate) struct ReadbackRows {
+    pub(crate) row_bytes: usize,
+    pub(crate) rows: usize,
+    pub(crate) depth: usize,
+    pub(crate) slice_rows: usize,
+    pub(crate) host_pitch: usize,
+    pub(crate) title_pitch: usize,
+    pub(crate) host_start: usize,
+    pub(crate) title_start: usize,
+}
+
+#[cfg(windows)]
+impl ReadbackRows {
+    pub(crate) fn title_span(&self) -> usize {
+        let last_row = (self.depth - 1) * self.slice_rows + self.rows - 1;
+        last_row * self.title_pitch + self.row_bytes
+    }
+}
+
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
@@ -735,21 +756,54 @@ impl PlacedFootprint {
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
-    /// For a read back through a host buffer: this footprint at offset 0
-    /// with its rows pitched as the host wants them (multiples of 256
-    /// bytes), then the bytes that buffer needs, the bytes of a row, the
-    /// rows, and the title's own pitch.
-    pub(crate) fn host_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
+    /// The full footprint at offset zero with D3D12's row alignment, the
+    /// buffer sizes, and the part of each footprint written by the copy.
+    #[cfg(windows)]
+    pub(crate) fn host_readback(
+        &self,
+        at: [u32; 3],
+        size: [u32; 3],
+    ) -> Option<(Self, [u64; 2], ReadbackRows)> {
         let (element, block) = element(self.format)?;
-        let lines = (u64::from(self.height).div_ceil(block) * u64::from(self.depth)).max(1);
-        let row = u64::from(self.width).div_ceil(block) * element;
-        let pitch = row.max(1).next_multiple_of(256);
+        let [x, y, z] = at.map(u64::from);
+        let [width, height, depth] = size.map(u64::from);
+        if size.contains(&0)
+            || x + width > u64::from(self.width)
+            || y + height > u64::from(self.height)
+            || z + depth > u64::from(self.depth)
+            || !x.is_multiple_of(block)
+            || !y.is_multiple_of(block)
+        {
+            return None;
+        }
+        let full_row_bytes = u64::from(self.width).div_ceil(block) * element;
+        let slice_rows = u64::from(self.height).div_ceil(block);
+        let full_rows = slice_rows.checked_mul(u64::from(self.depth))?;
+        let host_pitch = full_row_bytes.next_multiple_of(256);
+        let title_pitch = u64::from(self.row_pitch);
+        if title_pitch < full_row_bytes {
+            return None;
+        }
+        let host_bytes = host_pitch.checked_mul(full_rows)?;
+        let title_bytes = title_pitch.checked_mul(full_rows - 1)?.checked_add(full_row_bytes)?;
+        let first_row = z * slice_rows + y / block;
+        let column = x / block * element;
         let host = PlacedFootprint {
             offset: 0,
-            row_pitch: u32::try_from(pitch).ok()?,
+            row_pitch: u32::try_from(host_pitch).ok()?,
             ..*self
         };
-        Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
+        let rows = ReadbackRows {
+            row_bytes: usize::try_from(width.div_ceil(block) * element).ok()?,
+            rows: usize::try_from(height.div_ceil(block)).ok()?,
+            depth: usize::try_from(depth).ok()?,
+            slice_rows: usize::try_from(slice_rows).ok()?,
+            host_pitch: usize::try_from(host_pitch).ok()?,
+            title_pitch: usize::try_from(title_pitch).ok()?,
+            host_start: usize::try_from(first_row * host_pitch + column).ok()?,
+            title_start: usize::try_from(first_row * title_pitch + column).ok()?,
+        };
+        Some((host, [host_bytes, title_bytes], rows))
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -3771,6 +3825,133 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readback_layout_counts_block_rows_and_volume_slices() {
+        let bc = PlacedFootprint {
+            offset: 512, format: 71, width: 16, height: 16, depth: 1, row_pitch: 64,
+        };
+        let (host, sizes, rows) = bc.host_readback([4, 4, 0], [8, 8, 1]).unwrap();
+        assert_eq!((host.offset, host.row_pitch), (0, 256));
+        assert_eq!(sizes, [1024, 224]);
+        assert_eq!((rows.row_bytes, rows.rows), (16, 2));
+        assert_eq!((rows.host_start, rows.title_start, rows.title_span()), (264, 72, 80));
+        assert!(bc.host_readback([1, 4, 0], [8, 8, 1]).is_none());
+        assert!(bc.host_readback([12, 4, 0], [8, 8, 1]).is_none());
+
+        let volume = PlacedFootprint {
+            offset: 0, format: 28, width: 4, height: 4, depth: 3, row_pitch: 64,
+        };
+        let (_, _, rows) = volume.host_readback([1, 1, 1], [2, 2, 2]).unwrap();
+        assert_eq!((rows.row_bytes, rows.rows, rows.depth, rows.slice_rows), (8, 2, 2, 4));
+        assert_eq!((rows.host_start, rows.title_start, rows.title_span()), (1284, 324, 328));
+        assert!(volume.host_readback([0, 0, 2], [2, 2, 2]).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_partial_texture_readback_preserves_unwritten_bytes() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (adapter, _) = crate::host::adapter_summary().expect("identified test adapter");
+        println!("readback adapter: {adapter}");
+
+        const IMAGE_WIDTH: usize = 4;
+        const PIXEL_BYTES: usize = 4;
+        const UPLOAD_PITCH: usize = 256;
+        const OUTPUT_PITCH: usize = 64;
+        const ZERO_ORIGIN: usize = 512;
+        const OFFSET_ORIGIN: usize = 1024;
+        const WHOLE_SOURCE: usize = 1536;
+        const BUFFER_BYTES: usize = 4096;
+        const SENTINEL: u8 = 0xcd;
+        let null = std::ptr::null();
+        let make = |desc: &ResourceDesc, state| {
+            let mut resource = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), &RESOURCE_IIDS[0], &mut resource),
+                S_OK
+            );
+            resource
+        };
+        let image = make(&texture(IMAGE_WIDTH as u64, 4, 28, 1), 0x400);
+        let source = make(&buffer(BUFFER_BYTES as u64), 0);
+        let output = make(&buffer(BUFFER_BYTES as u64), 0);
+        let input = buffer_bytes(source).unwrap().0;
+        let result = buffer_bytes(output).unwrap().0;
+        let mut pattern = [0u8; UPLOAD_PITCH * 4];
+        for row in 0..4 {
+            for col in 0..IMAGE_WIDTH * PIXEL_BYTES {
+                pattern[row * UPLOAD_PITCH + col] = (row * 32 + col) as u8;
+            }
+        }
+        // SAFETY: both title buffers are live and hold BUFFER_BYTES bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), input, pattern.len());
+            result.write_bytes(SENTINEL, BUFFER_BYTES);
+        }
+
+        let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+        assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let upload = PlacedFootprint {
+            offset: 0, format: 28, width: IMAGE_WIDTH as u32, height: 4, depth: 1, row_pitch: UPLOAD_PITCH as u32,
+        };
+        let destination = |offset: usize, width, height| Location {
+            resource: output,
+            kind: 1,
+            footprint: PlacedFootprint { offset: offset as u64, width, height, row_pitch: OUTPUT_PITCH as u32, ..upload },
+        };
+        let image = Location { resource: image, kind: 0, footprint: upload };
+        let from = Location { resource: source, kind: 1, footprint: upload };
+        let source_box = [1u32, 1, 0, 3, 3, 1];
+        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u32);
+        let copy = slot::<Copy>(list, 0x80);
+        copy(list, &image, 0, 0, 0, &from, null.cast());
+        copy(list, &destination(ZERO_ORIGIN, 4, 4), 0, 0, 0, &image, source_box.as_ptr());
+        copy(list, &destination(OFFSET_ORIGIN, 4, 4), 1, 1, 0, &image, source_box.as_ptr());
+        copy(list, &destination(WHOLE_SOURCE, 6, 6), 0, 0, 0, &image, null.cast());
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        host.execute(&[crate::list::host_list(list).unwrap()]);
+
+        // SAFETY: execute waited for the GPU and landed the title readback.
+        let actual = unsafe { std::slice::from_raw_parts(result, BUFFER_BYTES) }.to_vec();
+        for object in [list, allocator, source, image.resource, output] {
+            slot::<Release>(object, 0x10)(object);
+        }
+
+        let mut expected = vec![SENTINEL; BUFFER_BYTES];
+        for row in 0..2 {
+            let from = (row + 1) * UPLOAD_PITCH + PIXEL_BYTES;
+            let pixels = &pattern[from..from + 2 * PIXEL_BYTES];
+            for to in [ZERO_ORIGIN + row * OUTPUT_PITCH, OFFSET_ORIGIN + (row + 1) * OUTPUT_PITCH + PIXEL_BYTES] {
+                expected[to..to + pixels.len()].copy_from_slice(pixels);
+                assert_eq!(&actual[to..to + pixels.len()], pixels, "copied row {row} at byte {to}");
+            }
+        }
+        for row in 0..4 {
+            let pixels = &pattern[row * UPLOAD_PITCH..row * UPLOAD_PITCH + IMAGE_WIDTH * PIXEL_BYTES];
+            let to = WHOLE_SOURCE + row * OUTPUT_PITCH;
+            expected[to..to + pixels.len()].copy_from_slice(pixels);
+            assert_eq!(&actual[to..to + pixels.len()], pixels, "whole-source row {row}");
+        }
+        let wrong = actual.iter().zip(&expected).position(|(got, want)| got != want);
+        if let Some(at) = wrong {
+            panic!("readback changed byte {at} outside the requested region: got {:#04x}, expected {:#04x}", actual[at], expected[at]);
+        }
+        println!("readback copied 96 bytes and preserved all 4000 surrounding bytes");
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

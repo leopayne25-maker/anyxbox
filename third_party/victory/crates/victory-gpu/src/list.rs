@@ -1048,8 +1048,7 @@ pub(crate) struct CopyLocation {
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer through readback memory.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -1227,26 +1226,60 @@ fn read_back(
     src: CopyLocation,
     source_box: *const [u32; 6],
 ) -> Result<(), &'static str> {
-    use windows::Win32::Graphics::Direct3D12::D3D12_BOX;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BOX, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+    };
     use windows::core::Interface;
     const FOOTPRINT: u32 = 1;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_READ_BACK").is_none_or(|v| v != "0")) {
         return Err("switched off");
     }
-    if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
+    if dst.kind != FOOTPRINT || src.kind != 0 {
         return Err("not a texture subresource into a placed footprint");
     }
-    if (x, y, z) != (0, 0, 0) {
-        return Err("a destination corner other than the footprint's");
-    }
     let host = crate::host::host().ok_or("no host")?;
-    let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
-    // The title's buffer holds every row at its own pitch.
-    let bytes = pitch * (rows - 1) + row;
-    let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
-    let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+    // SAFETY: a live texture, and a title box of the same layout or null.
+    let (desc, source_box) = unsafe { (texture.GetDesc(), source_box.cast::<D3D12_BOX>().as_ref()) };
+    let mip = src.footprint.offset as u32 % u32::from(desc.MipLevels.max(1));
+    let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        u32::from(desc.DepthOrArraySize)
+    } else {
+        1
+    };
+    let extent = [
+        ((desc.Width >> mip) as u32).max(1),
+        (desc.Height >> mip).max(1),
+        (depth >> mip).max(1),
+    ];
+    let at = [x, y, z];
+    let size = if let Some(b) = source_box {
+        let size = [
+            b.right.saturating_sub(b.left),
+            b.bottom.saturating_sub(b.top),
+            b.back.saturating_sub(b.front),
+        ];
+        if size.contains(&0) {
+            return Ok(());
+        }
+        if b.right > extent[0] || b.bottom > extent[1] || b.back > extent[2] {
+            return Err("a box outside the source subresource");
+        }
+        size
+    } else {
+        extent
+    };
+    if (source_box.is_some() || at != [0; 3])
+        && (desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || desc.SampleDesc.Count > 1)
+    {
+        return Err("depth-stencil and multisample copies require a whole subresource");
+    }
+    let (footprint, [host_bytes, title_bytes], rows) = dst.footprint
+        .host_readback(at, size)
+        .ok_or("a region outside its footprint or an invalid layout")?;
+    let data = buffer_range(dst.resource, dst.footprint.offset, title_bytes).ok_or("a destination outside its buffer")?;
+    let buffer = host.read_back_buffer(host_bytes).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
@@ -1259,22 +1292,28 @@ fn read_back(
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint = footprint;
-    let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
     #[cfg(feature = "diagnostics")]
     list.note_op(|| {
         format!(
-            "read back of {:?} sub {} into buffer {:?}+{:#x}: {rows} rows of {row} bytes",
-            src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset
+            "read back of {:?} sub {} into buffer {:?}+{:#x}: {} slices of {} rows of {} bytes",
+            src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset + rows.title_start as u64,
+            rows.depth, rows.rows, rows.row_bytes
         )
     });
     // SAFETY: an open list; both locations in the host's layout (asserted
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
     unsafe {
-        list.list
-            .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(),
+            x,
+            y,
+            z,
+            (&raw const from).cast(),
+            source_box.map(std::ptr::from_ref),
+        )
     };
-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize], src.resource);
+    list.defer_read_back(buffer, data, rows, src.resource);
     Ok(())
 }
 

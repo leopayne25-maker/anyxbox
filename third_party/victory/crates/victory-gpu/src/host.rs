@@ -2596,11 +2596,9 @@ struct Deferred {
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Textures read back (texture to buffer copies), done once the list
-    /// has run: the host buffer the list copies the texels into, the title
-    /// memory they go to, the bytes of a row, the rows, the title's row
-    /// pitch; and, for the walls trace only, the title texture read and
-    /// the frame the copy was recorded in.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3], usize, u64)>,
+    /// has run. Holds the host buffer, title address, row layout, and the
+    /// title texture and frame for the walls trace.
+    backs: Vec<(ID3D12Resource, usize, crate::resource::ReadbackRows, usize, u64)>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that the
     /// list's shaders write, copied when the list closes.
     back_wanted: Vec<usize>,
@@ -3860,11 +3858,6 @@ pub(crate) fn walls_trace() -> bool {
 
 /// After `list` has run: the texels its read-backs copied into host
 /// buffers of ours go to the title's memory (`HostList::defer_read_back`).
-///
-/// A submission that is waited for did this itself. One sent ahead
-/// ([`late`]) did not, at any stage: the flights' lists were settled
-/// without it, so the title read a buffer nobody wrote, as before read-backs
-/// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
     #[cfg(feature = "diagnostics")]
     for work in &list.deferred().after {
@@ -3873,28 +3866,38 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
-    for (buffer, at, [row, rows, pitch], source, recorded) in &list.deferred().backs {
+    for (buffer, at, layout, source, recorded) in &list.deferred().backs {
         let mut landed = false;
         let mut data = std::ptr::null_mut();
+        let dst = *at + layout.title_start;
+        let row = layout.row_bytes;
+        let rows = layout.rows * layout.depth;
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
         // copy was recorded).
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
-                let from = data.cast::<u8>().cast_const();
-                for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                let from = data.cast::<u8>().add(layout.host_start).cast_const();
+                for slice in 0..layout.depth {
+                    for line in 0..layout.rows {
+                        let row_index = slice * layout.slice_rows + line;
+                        std::ptr::copy_nonoverlapping(
+                            from.add(row_index * layout.host_pitch),
+                            (dst as *mut u8).add(row_index * layout.title_pitch),
+                            row,
+                        );
+                    }
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
-                if walls_trace() && *rows == 1 && *row <= 96 {
+                if walls_trace() && rows == 1 && row <= 96 {
                     let mut values = [0f32; 24];
-                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
+                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), row & !3);
                     tracing::info!(
                         frame = crate::frame::current(),
-                        to = format_args!("{:#x}", *at),
-                        bytes = *row,
-                        values = ?&values[..*row / 4],
+                        to = format_args!("{dst:#x}"),
+                        bytes = row,
+                        values = ?&values[..row / 4],
                         "walls trace: a read-back lands in title memory"
                     );
                 }
@@ -3903,7 +3906,7 @@ fn read_backs(list: &HostList) {
             }
         }
         let bytes = row * rows;
-        walls_landed(READ_BACK, *at, pitch * (rows - 1) + row, bytes, if landed { bytes } else { 0 }, *source, Some(*recorded));
+        walls_landed(READ_BACK, dst, layout.title_span(), bytes, if landed { bytes } else { 0 }, *source, Some(*recorded));
     }
 }
 
@@ -7197,16 +7200,14 @@ impl HostList {
         Some((buffer, at))
     }
 
-    /// A read back: once the list has run, `rows` rows of `row` bytes go
-    /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
-    /// to title memory at `dst`, pitched `pitch`. The buffer lives until
-    /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3], source: crate::object::This) {
+    /// Once the list runs, the copied rows go from the host footprint in
+    /// `buffer` to the title's footprint at `dst`.
+    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, rows: crate::resource::ReadbackRows, source: crate::object::This) {
         // (Neptune) Title memory or a buffer changes at this place in the list: a table made
         // ready before it is made ready again after it (`crate::draw`).
         self.changes.fetch_add(1, Ordering::Relaxed);
         let recorded = crate::frame::current();
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch], source as usize, recorded));
+        self.deferred().backs.push((buffer, dst as usize, rows, source as usize, recorded));
     }
 
     /// Runs `work` once the list has run, with its read-backs

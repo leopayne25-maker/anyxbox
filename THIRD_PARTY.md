@@ -52,6 +52,7 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 | Trexies | GPL-3.0 | Petits tampons regroupés | |
 | Le correctif de redirection FidelityFX reçu pour DexNom Runtime | GPL-3.0 | `VICTORY_FSR_DLL` (mode Series S, non utilisé par le lanceur) | |
 | [LooperSalty/victory](https://github.com/LooperSalty/victory) (Looper_Salty) | GPL-3.0 ou ultérieure | | Les quatre commits `xg:` (`19feca8`, `1f0fe1d`, `36955ee`, `fb021f7`) : `xg_xs.dll` du GDK de l'utilisateur comme oracle ou service (`VICTORY_XG_DLL`, `VICTORY_XG_MODE`, jamais copiée dans le dépôt) et HLE qui répond comme la DLL de Microsoft |
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory/commit/5cb63d8b28b950a2f4d25bef1c341de133771c24) (Marvis) | GPL-3.0 ou ultérieure | | Adaptation de la copie par région lors de la lecture d'une texture vers un tampon |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 
