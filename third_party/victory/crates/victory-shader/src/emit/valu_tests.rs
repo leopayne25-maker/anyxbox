@@ -308,6 +308,104 @@ fn packed_add_selects_halves_of_inline_constants() {
     }
 }
 
+const U32_CLAMP_CASES: [[u32; 4]; 10] = [
+    [u32::MAX, 1, 0, 0],
+    [0, 1, 0, 0],
+    [1, 0, 0, 0],
+    [u32::MAX, 0, 1, 0],
+    [u32::MAX - 1, 0, 1, 0],
+    [u32::MAX, u32::MAX, 1, 0],
+    [9, 9, 1, 0],
+    [10, 9, 1, 0],
+    [9, 10, 1, 0],
+    [8, 5, 0, 0],
+];
+
+// AMD RDNA 2 ISA section 6.5: clamp the exact integer result to its
+// representable range. The carry or borrow is determined before saturation.
+fn exact_u32_add_sub(name: &str, a: u32, b: u32, cin: u32) -> i64 {
+    let (a, b, cin) = (i64::from(a), i64::from(b), i64::from(cin));
+    if name.starts_with("v_add") {
+        a + b + cin
+    } else if name.starts_with("v_subrev") {
+        b - a - cin
+    } else {
+        a - b - cin
+    }
+}
+
+#[test]
+fn clamped_u32_add_sub_without_carry() {
+    for (op, name) in [
+        (0x125, "v_add_nc_u32"),
+        (0x126, "v_sub_nc_u32"),
+        (0x127, "v_subrev_nc_u32"),
+    ] {
+        let shader = build_valu_cs(&vop3_mod(op, 0, vgpr(1), vgpr(2), 0x80, 0, 0, 0, true));
+        run_cases(&shader, &U32_CLAMP_CASES, |backend, _, [a, b, _, _], got| {
+            let total = exact_u32_add_sub(name, a, b, 0);
+            let expected = total.clamp(0, i64::from(u32::MAX)) as u32;
+            assert_eq!(got, expected, "{backend}: {name} on {a:#x}, {b:#x}");
+        });
+    }
+}
+
+#[test]
+fn clamped_u32_add_sub_preserves_carry() {
+    for (op, name) in [
+        (0x30f, "v_add_co_u32"),
+        (0x310, "v_sub_co_u32"),
+        (0x319, "v_subrev_co_u32"),
+        (0x128, "v_add_co_ci_u32"),
+        (0x129, "v_sub_co_ci_u32"),
+        (0x12a, "v_subrev_co_ci_u32"),
+    ] {
+        let with_cin = name.contains("_ci_");
+        let mut body = Vec::new();
+        if with_cin {
+            // v_cmp_eq_u32 vcc_lo, 1, v3 sets this lane's carry-in bit.
+            body.extend(vop3(0x0c2, 106, 0x81, vgpr(3), 0x80));
+        }
+        let src2 = if with_cin { sgpr(106) } else { 0x80 };
+        let [lo, hi] = vop3_mod(op, 0, vgpr(1), vgpr(2), src2, 0, 0, 0, true);
+        body.extend([lo | (6 << 8), hi]); // VOP3B SDST = s6
+        let result = build_valu_cs(&body);
+        // v_cndmask_b32 v0, 0, 1, s6 reads the produced carry or borrow bit.
+        body.extend(vop3(0x101, 0, 0x80, 0x81, sgpr(6)));
+        let carry = build_valu_cs(&body);
+        for (shader, read_carry) in [(&result, false), (&carry, true)] {
+            run_cases(shader, &U32_CLAMP_CASES, |backend, _, [a, b, k, _], got| {
+                let cin = if with_cin { k } else { 0 };
+                let total = exact_u32_add_sub(name, a, b, cin);
+                let sat = total.clamp(0, i64::from(u32::MAX));
+                let expected = if read_carry { u32::from(total != sat) } else { sat as u32 };
+                assert_eq!(
+                    got, expected,
+                    "{backend}: {name} on {a:#x}, {b:#x}, carry in {cin}, read carry {read_carry}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn clamped_u32_add3_saturates_on_either_carry() {
+    let cases = [
+        [u32::MAX, 1, 0, 0],  // first addition carries
+        [u32::MAX, 0, 1, 0],  // second addition carries
+        [u32::MAX; 4],        // both additions carry
+        [u32::MAX - 2, 1, 1, 0],
+        [2, 3, 4, 0],
+    ];
+    let body = vop3_mod(0x36d, 0, vgpr(1), vgpr(2), vgpr(3), 0, 0, 0, true);
+    let shader = build_valu_cs(&body);
+    run_cases(&shader, &cases, |backend, _, [a, b, c, _], got| {
+        let total = u64::from(a) + u64::from(b) + u64::from(c);
+        let expected = total.min(u64::from(u32::MAX)) as u32;
+        assert_eq!(got, expected, "{backend}: v_add3_u32 on {a:#x}, {b:#x}, {c:#x}");
+    });
+}
+
 /// 64-bit floats, which the title's water volumetrics count their lanes in: `v_add_f64` and
 /// `v_mul_f64` of register pairs (one operand negated, one an inline double),
 /// `v_cvt_f64_f32`, and `v_cvt_f32_f64` rounding to nearest (1 + 0.75 of a float's last

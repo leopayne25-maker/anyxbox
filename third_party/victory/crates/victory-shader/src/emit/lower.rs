@@ -35,6 +35,9 @@ mod descriptor_data;
 #[path = "float64.rs"]
 mod float64;
 
+#[path = "integer_carry.rs"]
+mod integer_carry;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -5776,31 +5779,6 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// `a + b (+ cin)` or `a - b (- cin)` with the carry (borrow) out, as the
-    /// scalar and vector add-with-carry instructions set it.
-    fn add_sub_carry(&mut self, c: usize, add: bool, a: V, b: V, cin: Option<V>) -> (V, V) {
-        let op = if add { Bin::Add } else { Bin::Sub };
-        let mut r = self.s.m.bin(c, op, a, b);
-        // Without a carry in: a + b wraps below a; a - b borrows when a < b.
-        let mut carry = if add {
-            self.s.m.cmp(c, pred::IULT, r, a)
-        } else {
-            self.s.m.cmp(c, pred::IULT, a, b)
-        };
-        if let Some(cin) = cin {
-            let one = self.s.m.cast(c, Cast::ZExt, cin, self.s.t.i32);
-            let t = r;
-            r = self.s.m.bin(c, op, t, one);
-            // The carry in carries on when the partial result is all ones
-            // (add) or zero (sub).
-            let edge = self.s.m.i32(if add { u32::MAX } else { 0 });
-            let at_edge = self.s.m.cmp(c, pred::EQ, t, edge);
-            let more = self.s.m.bin(c, Bin::And, cin, at_edge);
-            carry = self.s.m.bin(c, Bin::Or, carry, more);
-        }
-        (r, carry)
-    }
-
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
         // (`VICTORY_WAVE32_NVIDIA=1`) The SCC of a mask operation read by a scalar select:
@@ -7611,8 +7589,11 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }
-            "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32"
-            | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => {
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_add3_u32" | "v_add_co_u32"
+            | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32"
+            | "v_subrev_co_ci_u32"
+                if v.clamp || v.carry.is_some() =>
+            {
                 // The carry (borrow) out is a lane mask: this lane's bit.
                 let (mut a, mut bb) = (s(self, 0)?, s(self, 1)?);
                 if name.contains("subrev") {
@@ -7630,8 +7611,25 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
-                int(self, r)?;
+                let add = name.starts_with("v_add");
+                let (mut r, mut carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if name == "v_add3_u32" {
+                    let third = s(self, 2)?;
+                    let (sum, third_carry) = self.add_sub_carry(c, true, r, third, None);
+                    r = sum;
+                    carry = self.s.m.bin(c, Bin::Or, carry, third_carry);
+                }
+                if v.clamp && v.omod == 0 {
+                    // Only the vector result saturates. SDST keeps this lane's carry or borrow.
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("a result without a vector register");
+                    };
+                    let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                    let saturated = self.s.m.select(c, carry, limit, r);
+                    self.write(inst, Reg::V(reg), saturated, guard);
+                } else {
+                    int(self, r)?;
+                }
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
