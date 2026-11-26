@@ -35,6 +35,11 @@ mod descriptor_data;
 #[path = "float64.rs"]
 mod float64;
 
+/// Row lane permutations (`v_permlane16_b32`, `v_permlanex16_b32`), a child module so it shares
+/// the emitter's state.
+#[path = "permlane.rs"]
+mod permlane;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -1158,6 +1163,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -7360,42 +7366,7 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {
-                // Each lane reads src0 of a lane of its own 32-lane half,
-                // picked by nibble (lane & 15) of {src2, src1}: within its
-                // own row of 16 (`v_permlane16`) or the other row of its
-                // half (`v_permlanex16`). The pick stays inside a half, so a
-                // console wave of 64 run as two host waves of 32 needs no
-                // exchange.
-                // shortcut: a source lane with EXEC clear is read as the host
-                // gives it (the console keeps vdst unless op_sel's fetch
-                // inactive bit is set).
-                self.cross_lane(false)?;
-                let x = s(self, 0)?;
-                let (s1, s2) = (s(self, 1)?, s(self, 2)?);
-                let i32t = self.s.t.i32;
-                let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-                let [k15, k8, k7, k2, k16, not31, not15] =
-                    [15, 8, 7, 2, 16, !31, !15].map(|x| self.s.m.i32(x));
-                let low = self.s.m.bin(c, Bin::And, lane, k15);
-                // nibble `low` of the 64-bit selector: src1 holds lanes 0-7
-                let hi_word = self.s.m.cmp(c, pred::IUGE, low, k8);
-                let word = self.s.m.select(c, hi_word, s2, s1);
-                let n = self.s.m.bin(c, Bin::And, low, k7);
-                let sh = self.s.m.bin(c, Bin::Shl, n, k2);
-                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
-                let pick = self.s.m.bin(c, Bin::And, pick, k15);
-                let row = if name == "v_permlanex16_b32" {
-                    // the other row of this half
-                    let half = self.s.m.bin(c, Bin::And, lane, not31);
-                    let other = self.s.m.bin(c, Bin::And, lane, k16);
-                    let other = self.s.m.bin(c, Bin::Xor, other, k16);
-                    self.s.m.bin(c, Bin::Or, half, other)
-                } else {
-                    self.s.m.bin(c, Bin::And, lane, not15)
-                };
-                let from = self.s.m.bin(c, Bin::Or, row, pick);
-                let r = self.read_lane(x, from);
-                int(self, r)
+                self.permlane16(inst, name == "v_permlanex16_b32", guard)
             }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {

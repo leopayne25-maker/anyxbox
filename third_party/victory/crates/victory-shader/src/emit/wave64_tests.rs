@@ -1203,3 +1203,116 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+/// RDNA 2 `v_permlane16_b32` and `v_permlanex16_b32` inactive source-lane semantics
+/// (`op_sel[0]` = `fi`, `op_sel[1]` = `bound_ctrl`):
+/// - `fi:0 bound_ctrl:0`: reading an inactive source lane leaves `vdst` untouched.
+/// - `fi:0 bound_ctrl:1`: reading an inactive source lane writes `0`.
+/// - `fi:1`: fetches the inactive source lane's VGPR.
+/// - Reading an active source lane transfers its live value.
+/// Tested in guarded wave32, divergent-branch wave32, and paired wave64 on a 32-lane host.
+#[test]
+fn permlane16_and_x16_honor_inactive_source_lanes_fi_and_bound_ctrl() {
+    // VOP3 with op_sel (bit 0 = fi, bit 1 = bound_ctrl)
+    let vop3_sel = |op: u32, dst: u32, src0: u32, src1: u32, src2: u32, opsel: u32| -> [u32; 2] {
+        [
+            0xD400_0000 | op << 16 | opsel << 11 | dst,
+            src0 | src1 << 9 | src2 << 18,
+        ]
+    };
+    // Selector swapping even/odd pairs within each row of 16: nibble i = i ^ 1
+    // lanes 0..7: 0x6745_2301, lanes 8..15: 0xEFCD_AB89
+    const SEL_ODD_LO: u32 = 0x6745_2301;
+    const SEL_ODD_HI: u32 = 0xEFCD_AB89;
+    // Selector swapping by 2 (even -> active even): nibble i = i ^ 2
+    // lanes 0..7: 0x5476_1032, lanes 8..15: 0xDCFE_98BA
+    const SEL_EVEN_LO: u32 = 0x5476_1032;
+    const SEL_EVEN_HI: u32 = 0xDCFE_98BA;
+
+    let build_body = |wave64: bool, branch: bool, cross: bool| -> Vec<u32> {
+        let op = if cross { 0x378 } else { 0x377 };
+        let mut w = vop3(0x169, 1, v(0), k(10)).to_vec(); // v_mul_lo_u32 v1, v0, 10
+        w.extend([
+            vop2(0x25, 1, k(1), 1), // v1 = 10*lane + 1
+            vop1(0x01, 4, LIT),
+            0xAAAA, // v4 sentinel
+            vop1(0x01, 5, LIT),
+            0xBBBB, // v5 sentinel
+            vop1(0x01, 6, LIT),
+            0xCCCC, // v6 sentinel
+            vop1(0x01, 7, LIT),
+            0xDDDD,                 // v7 sentinel
+            vop2(0x1B, 2, k(1), 0), // v2 = v0 & 1
+            vopc(0xC2, k(0), 2),    // vcc = (v0 % 2 == 0)
+            sop1(if wave64 { 0x24 } else { 0x3C }, 12, VCC),
+        ]);
+        if branch {
+            // 4 x 2-dword v_permlane* instructions (or 3 when skipping fi:1)
+            w.push(sopp(0x08, if wave64 { 8 } else { 6 }));
+        }
+        // 1. fi:0, bc:0 reading inactive odd lane -> preserve v4 (0xAAAA)
+        w.extend(vop3_sel(op, 4, v(1), 0, 1, 0b00));
+        // 2. fi:0, bc:1 reading inactive odd lane -> write 0 into v5
+        w.extend(vop3_sel(op, 5, v(1), 0, 1, 0b10));
+        // 3. fi:0, bc:0 reading active even lane (n ^ 2, other row if cross) -> write live value into v7
+        w.extend(vop3_sel(op, 7, v(1), 2, 3, 0b00));
+        // 4. fi:1, bc:0 reading inactive odd lane (in guarded / paired modes where inactive lanes stay live)
+        if !branch || wave64 {
+            w.extend(vop3_sel(op, 6, v(1), 0, 1, 0b01));
+        }
+        w.push(sop1(if wave64 { 0x04 } else { 0x03 }, EXEC, 12));
+        w.extend(stores([4, 5, 6, 7]));
+        w
+    };
+
+    let want_for = |lanes: u32, cross: bool, check_fi: bool| -> Vec<u32> {
+        let val = |n: u32| 10 * n + 1;
+        let row_flip = if cross { 16 } else { 0 };
+        (0..lanes)
+            .flat_map(|n| {
+                if n % 2 == 0 {
+                    let v6 = if check_fi { val((n ^ row_flip) ^ 1) } else { 0xCCCC };
+                    [0xAAAA, 0, v6, val((n ^ row_flip) ^ 2)]
+                } else {
+                    [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD]
+                }
+            })
+            .collect()
+    };
+
+    let consts = [SEL_ODD_LO, SEL_ODD_HI, SEL_EVEN_LO, SEL_EVEN_HI];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+
+    for cross in [false, true] {
+        // 1. Guarded wave32 compute
+        let w32 = build_body(false, false, cross);
+        let native32 = native_of(&w32, false, 32);
+        let p32 = ir::build(&native32.code, native32.wave64, native32.vgprs).expect("ir::build");
+        let shader32 = lowered(&native32, &p32, &HashSet::new()).expect("lower wave32");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader32.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Some(got32) = run_paired(&shader32, consts, 128) else { return };
+        same_as_console(&got32, &want_for(32, cross, true));
+
+        // 2. Divergent-branch wave32 compute
+        let w32_br = build_body(false, true, cross);
+        let native32_br = native_of(&w32_br, false, 32);
+        let p32_br = ir::build(&native32_br.code, native32_br.wave64, native32_br.vgprs).expect("ir::build");
+        let shader32_br = lowered(&native32_br, &p32_br, &HashSet::new()).expect("lower wave32 branch");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader32_br.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Some(got32_br) = run_paired(&shader32_br, consts, 128) else { return };
+        same_as_console(&got32_br, &want_for(32, cross, false));
+
+        // 3. Paired wave64 compute on a 32-lane host
+        let w64 = build_body(true, true, cross);
+        let shader64 = paired(&native_with(&w64, true, 64, 0));
+        let Some(got64) = run_paired(&shader64, consts, 256) else { return };
+        same_as_console(&got64, &want_for(64, cross, true));
+    }
+    eprintln!("ran on the hardware device: v_permlane16 and v_permlanex16 honored EXEC, fi, and bound_ctrl in wave32 and paired wave64");
+}
