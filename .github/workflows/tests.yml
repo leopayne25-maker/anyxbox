@@ -72,10 +72,15 @@ jobs:
       # Cache des dépendances compilées des deux espaces Cargo (rust/ et TomBox), sans nos propres
       # crates. Écrit seulement depuis main pour ne pas multiplier les gros caches de PR ; les PR
       # le lisent.
+      # Version de Rust épinglée à la racine (rust-toolchain.toml, comme VIctory) : installée
+      # avant tout appel à cargo, pour rust/, TomBox et l'espace racine.
+      - name: Rust épinglé (rust-toolchain.toml)
+        run: rustup toolchain install
       - name: Cache Rust (rust/ et third_party/tombox)
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
+            . -> target
             rust -> target
             third_party/tombox -> target
           cache-on-failure: true
@@ -84,6 +89,12 @@ jobs:
         run: |
           cargo build --release --manifest-path rust/Cargo.toml
           cargo test --release --manifest-path rust/Cargo.toml
+      # Espace Cargo racine (crates/, docs/architecture-rust.md) : ses tests Rust, et les binaires
+      # que les tests de parité avec Python lancent (tests/test_rust_pe_parity.py).
+      - name: Rust (espace racine, crates/)
+        run: |
+          cargo build --release --workspace
+          cargo test --release --workspace
       # rust-cache ne garde que les dépendances : les 15 crates de TomBox elles-mêmes (membres de
       # son espace Cargo) seraient recompilées à chaque passage. Les 8 DLL ne dépendent que du
       # commit du sous-module, du script et de la version de rustc : on les met en cache telles

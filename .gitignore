@@ -14,3 +14,6 @@ rust/target/
 # Paramètres et worktrees Claude Code personnels
 .claude/settings.local.json
 .claude/worktrees/
+
+# Root Cargo workspace (crates/)
+/target/

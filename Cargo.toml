@@ -1,0 +1,41 @@
+# AnyXboxX root Cargo workspace: the target of the move to 100 % Rust (docs/architecture-rust.md).
+#
+# New crates go in crates/. Three trees keep their own workspace for now and are excluded here,
+# because Cargo refuses a package that two workspaces claim, and a package excluded by its own
+# workspace (VIctory's tests/fixtures) would otherwise climb up to this one:
+# - rust/          : moves into crates/ in phase 1, then rust/Cargo.toml is deleted;
+# - third_party/   : VIctory (its own toolchain pin and lints) and the TomBox submodule; our crates
+#                    depend on VIctory's crates by path instead of re-declaring them as members;
+# - .claude/       : Claude Code worktrees, which hold full checkouts of this repository.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["rust", "third_party", ".claude"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+# Reused as is from VIctory (our code since #199): never re-implemented here.
+victory-pe = { path = "third_party/victory/crates/victory-pe" }
+
+# Same versions as VIctory's workspace, so both share one set of downloaded crates.
+thiserror = "2.0.21"
+
+# Ported AnyXboxX crates.
+anyxboxx-pe = { path = "crates/anyxboxx-pe" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+debug = "line-tables-only"

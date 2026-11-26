@@ -1,0 +1,23 @@
+[package]
+name = "anyxboxx-pe"
+description = "AnyXboxX's view of a PE32+ image (base, imports, exports, TLS, page protections), built on victory-pe. Rust port of PrototypeScarlett/emu/loader.py."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "anyxboxx_pe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anyxboxx-pe"
+path = "src/main.rs"
+
+[dependencies]
+victory-pe.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
