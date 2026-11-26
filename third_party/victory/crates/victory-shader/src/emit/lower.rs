@@ -1912,15 +1912,44 @@ impl<'a> Lower<'a> {
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         let mut mirror: Option<LaneMirror> = None;
+        let mut first_lane_uniform = None;
         // D3D12 caps thread-group shared memory at 32 KiB (8,192 dwords).
         const MAX_LDS_DWORDS: u32 = 8192;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            let mut wave = if x.native.wave64 { 64 } else { 32 };
+            let group = cs.threads.iter().product::<u32>();
+            // A non-waterfall first-lane read of a varying VGPR may need the other half.
+            let first_lane_source = |i: &Inst| {
+                if i.name() != "v_readfirstlane_b32"
+                    || i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+                {
+                    return None;
+                }
+                match &i.fields {
+                    Fields::Valu(v) => match v.src.first() {
+                        Some(&Operand::Vector { reg, .. }) => i.read(Reg::V(reg)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            let first_lane_crosses = wave == 64
+                && group >= 64
+                && group.is_multiple_of(64)
+                && insts().any(|i| first_lane_source(i).is_some())
+                && {
+                    first_lane_uniform = all_lane_blocks(x.st)
+                        .map(|all| lane_uniform(p, x.st, &all, wave_tid(p, x)));
+                    insts().filter_map(first_lane_source).any(|source| {
+                        !first_lane_uniform.as_ref().is_some_and(|uniform| uniform.contains(&source))
+                    })
+                };
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            console_lanes = first_lane_crosses || insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -1932,8 +1961,6 @@ impl<'a> Lower<'a> {
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
-            let mut wave = if x.native.wave64 { 64 } else { 32 };
-            let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
@@ -1944,7 +1971,7 @@ impl<'a> Lower<'a> {
             // lane-constant masks), nor when LDS may be shared within the console wave without
             // barriers (a group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                let crosses = insts().any(|i| {
+                let crosses = first_lane_crosses || insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
@@ -2263,7 +2290,9 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, wave_tid(p, x)),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => {
+                    first_lane_uniform.unwrap_or_else(|| lane_uniform(p, x.st, all, wave_tid(p, x)))
+                },
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
