@@ -452,3 +452,127 @@ fn generated_swizzle_sweep() {
     }
     eprintln!("ran on the hardware device: the swizzle sweep");
 }
+
+/// RDNA 2 DPP16 and DPP8 inactive source-lane semantics (`EXEC`, `bound_ctrl`, `fi`):
+/// - With `fi:0` and `bound_ctrl:0`, reading an inactive source lane leaves `vdst` untouched.
+/// - With `fi:0` and `bound_ctrl:1` (DPP16), reading an inactive source lane supplies `0`.
+/// - With `fi:1` (fetch-inactive), reading an inactive source lane reads its VGPR value.
+/// - Reading an active source lane transfers its live value.
+/// Tested in guarded wave32, divergent-branched wave32, and split wave64-on-wave32.
+#[test]
+fn dpp16_and_dpp8_honor_inactive_source_lanes_and_fi() {
+    // dpp8:[1,0,3,2,5,4,7,6] (each lane swaps with its odd/even neighbour)
+    const DPP8_SWAP1: u32 = 1 | 0 << 3 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21;
+    let dpp16 = |ctrl: u32, bound_ctrl: bool, fi: bool| -> u32 {
+        0xFF00_0000 | u32::from(bound_ctrl) << 19 | u32::from(fi) << 18 | ctrl << 8 | 1
+    };
+    let sopp = |op: u32, simm16: i16| -> u32 { 0xBF80_0000 | op << 16 | u32::from(simm16 as u16) };
+
+    let build_guarded = |wave64: bool| -> Vec<u32> {
+        let mut w = vop3(0x169, 1, v(0), k(10)).to_vec(); // v_mul_lo_u32 v1, v0, 10
+        w.extend([
+            vop2(0x25, 1, k(1), 1), // v_add_nc_u32 v1, 1, v1 (10*lane + 1)
+            vop1(0x01, 4, LIT),
+            0xAAAA,
+            vop1(0x01, 5, LIT),
+            0xBBBB,
+            vop1(0x01, 6, LIT),
+            0xCCCC,
+            vop1(0x01, 7, LIT),
+            0xDDDD,
+            vop2(0x1B, 2, k(1), 0), // v_and_b32 v2, 1, v0
+            vopc(0xC2, k(0), 2),    // v_cmp_eq_u32 vcc, 0, v2 (even lanes active)
+            sop1(if wave64 { 0x24 } else { 0x3C }, 12, VCC), // s_and_saveexec_b64/b32 s12, vcc
+            // 1. DPP16 quad_perm:[1,0,3,2] (0xB1) bound_ctrl:0 fi:0 -> inactive odd source: keep v4
+            vop1(0x01, 4, 0xFA),
+            dpp16(0xB1, false, false),
+            // 2. DPP16 quad_perm:[1,0,3,2] (0xB1) bound_ctrl:1 fi:0 -> inactive odd source: write 0
+            vop1(0x01, 5, 0xFA),
+            dpp16(0xB1, true, false),
+            // 3. DPP16 quad_perm:[1,0,3,2] (0xB1) bound_ctrl:0 fi:1 -> fetch inactive odd source
+            vop1(0x01, 6, 0xFA),
+            dpp16(0xB1, false, true),
+            // 4. DPP8 swap-1 fi:0 (0xE9) -> inactive odd source: keep v7
+            vop1(0x01, 7, 0xE9),
+            DPP8_SWAP1 << 8 | 1,
+            // 5. DPP16 quad_perm:[2,3,0,1] (0x4E) bound_ctrl:0 fi:0 -> active even source added to v5 (0)
+            vop2(0x25, 5, 0xFA, 5),
+            dpp16(0x4E, false, false),
+            sop1(if wave64 { 0x04 } else { 0x03 }, EXEC, 12),
+        ]);
+        w.extend(stores([4, 5, 6, 7]));
+        w
+    };
+
+    let want_for = |lanes: u32| -> Vec<u32> {
+        let val = |n: u32| 10 * n + 1;
+        (0..lanes)
+            .flat_map(|n| {
+                if n % 2 == 0 {
+                    [0xAAAA, val(n ^ 2), val(n ^ 1), 0xDDDD]
+                } else {
+                    [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD]
+                }
+            })
+            .collect()
+    };
+
+    let _one = super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 1. Guarded wave32 compute
+    let shader32 = emitted(&program(&build_guarded(false), false, 32), 32);
+    if let Some(got32) = run(&shader32, [0; 4], 128) {
+        same_as_console("guarded wave32", &got32, &want_for(32));
+    }
+
+    // 2. Divergent wave32 branch (guard == None; odd host lanes branched away)
+    let mut w32_br = vop3(0x169, 1, v(0), k(10)).to_vec();
+    w32_br.extend([
+        vop2(0x25, 1, k(1), 1),
+        vop1(0x01, 4, LIT),
+        0xAAAA,
+        vop1(0x01, 5, LIT),
+        0xBBBB,
+        vop1(0x01, 6, LIT),
+        0xCCCC,
+        vop1(0x01, 7, LIT),
+        0xDDDD,
+        vop2(0x1B, 2, k(1), 0),
+        vopc(0xC2, k(0), 2),
+        sop1(0x3C, 12, VCC), // s_and_saveexec_b32 s12, vcc
+        sopp(0x08, 8),       // s_cbranch_execz over 4 x 2-dword DPP instructions
+        vop1(0x01, 4, 0xFA),
+        dpp16(0xB1, false, false),
+        vop1(0x01, 5, 0xFA),
+        dpp16(0xB1, true, false),
+        vop1(0x01, 7, 0xE9),
+        DPP8_SWAP1 << 8 | 1,
+        vop2(0x25, 5, 0xFA, 5),
+        dpp16(0x4E, false, false),
+        sop1(0x03, EXEC, 12),
+    ]);
+    w32_br.extend(stores([4, 5, 6, 7]));
+    let shader32_br = emitted(&program(&w32_br, false, 32), 32);
+    let want32_br: Vec<u32> = (0..32u32)
+        .flat_map(|n| {
+            if n % 2 == 0 {
+                [0xAAAA, 10 * (n ^ 2) + 1, 0xCCCC, 0xDDDD]
+            } else {
+                [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD]
+            }
+        })
+        .collect();
+    if let Some(got32_br) = run(&shader32_br, [0; 4], 128) {
+        same_as_console("branched wave32", &got32_br, &want32_br);
+    }
+
+    // 3. Guarded wave64 compute on both 64-lane and 32-lane hosts
+    let native64 = program(&build_guarded(true), true, 64);
+    for host_wave in [64, 32] {
+        let shader64 = emitted(&native64, host_wave);
+        if let Some(got64) = run(&shader64, [0; 4], 256) {
+            same_as_console(&format!("guarded wave64 on {host_wave}-lane host"), &got64, &want_for(64));
+        }
+    }
+    eprintln!("ran on the hardware device: DPP16 and DPP8 honored EXEC, bound_ctrl, and fi");
+}

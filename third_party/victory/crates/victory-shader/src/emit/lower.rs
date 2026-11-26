@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -24,6 +24,10 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+
+/// DPP16 and DPP8 operand lowering, a child module so it shares the emitter's state.
+#[path = "dpp.rs"]
+mod dpp;
 
 type Why = &'static str;
 
@@ -8823,7 +8827,7 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -8833,148 +8837,6 @@ impl<'a> Lower<'a> {
         let r = self.valu_op(inst, guard);
         self.src0 = None;
         r
-    }
-
-    /// DPP: src0 as read from another lane, and which lanes write their
-    /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
-        let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
-        };
-        let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
-            return Err("a DPP operand");
-        };
-        let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let mesh_quad = self.s.mesh.is_some() && quad;
-        if !mesh_quad {
-            self.cross_lane(quad)?;
-        }
-        let c = self.cur;
-        let lane = self.lane_index();
-        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
-        let (sixteen_mask, low) = (k(self, !15), k(self, 15));
-        let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
-        let pos = self.s.m.bin(c, Bin::And, lane, low);
-        // Source lane, and whether it lies in the row.
-        let (src, inside, masks, zero) = match dpp {
-            Dpp::Lanes { sel, .. } => {
-                let (seven, not7, three) = (k(self, 7), k(self, !7), k(self, 3));
-                let p = self.s.m.bin(c, Bin::And, lane, seven);
-                let sh = self.s.m.bin(c, Bin::Mul, p, three);
-                let sel = k(self, sel);
-                let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
-                let pick = self.s.m.bin(c, Bin::And, pick, seven);
-                let base = self.s.m.bin(c, Bin::And, lane, not7);
-                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false)
-            }
-            Dpp::Row {
-                ctrl,
-                row_mask,
-                bank_mask,
-                bound_ctrl,
-                ..
-            } => {
-                let n = u32::from(ctrl & 15);
-                let (src, inside) = match ctrl {
-                    0..=0xFF => {
-                        let (three, one, not3) = (k(self, 3), k(self, 1), k(self, !3));
-                        let p = self.s.m.bin(c, Bin::And, lane, three);
-                        let sh = self.s.m.bin(c, Bin::Shl, p, one);
-                        let perm = k(self, u32::from(ctrl));
-                        let pick = self.s.m.bin(c, Bin::LShr, perm, sh);
-                        let pick = self.s.m.bin(c, Bin::And, pick, three);
-                        let base = self.s.m.bin(c, Bin::And, lane, not3);
-                        (self.s.m.bin(c, Bin::Or, base, pick), None)
-                    }
-                    0x101..=0x10F | 0x111..=0x11F => {
-                        let nn = k(self, n);
-                        let left = ctrl < 0x110;
-                        let (op, p) = if left {
-                            (Bin::Add, pred::IULT)
-                        } else {
-                            (Bin::Sub, pred::IUGE)
-                        };
-                        let s = self.s.m.bin(c, op, lane, nn);
-                        // Left: pos + n < 16; right: pos >= n.
-                        let bound = if left { k(self, 16 - n) } else { nn };
-                        (s, Some(self.s.m.cmp(c, p, pos, bound)))
-                    }
-                    0x121..=0x12F => {
-                        let nn = k(self, n);
-                        let t = self.s.m.bin(c, Bin::Sub, pos, nn);
-                        let t = self.s.m.bin(c, Bin::And, t, low);
-                        (self.s.m.bin(c, Bin::Or, row, t), None)
-                    }
-                    0x140 | 0x141 => {
-                        let m = k(self, if ctrl == 0x140 { 15 } else { 7 });
-                        let t = self.s.m.bin(c, Bin::Xor, lane, m);
-                        (t, None)
-                    }
-                    0x150..=0x15F => {
-                        let nn = k(self, n);
-                        (self.s.m.bin(c, Bin::Or, row, nn), None)
-                    }
-                    0x160..=0x16F => {
-                        let nn = k(self, n);
-                        (self.s.m.bin(c, Bin::Xor, lane, nn), None)
-                    }
-                    _ => return Err("a DPP lane pattern"),
-                };
-                let masks = (row_mask != 0xF || bank_mask != 0xF).then_some((row_mask, bank_mask));
-                (src, inside, masks, bound_ctrl)
-            }
-        };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
-        } else if let Dpp::Row { ctrl, .. } = dpp
-            && (self.helpers_read(quad) || (ctrl <= 0xFF && host_dxil_spirv()))
-        {
-            // (A quad permutation by the host's quad operations: also where
-            // dxil-spirv would take a `WaveReadLaneAt` out of its branches
-            // ([`LaneMirror`]). Host lanes 4n..4n+3 are a quad in compute
-            // programs too, the console's lanes in the same order. Only there:
-            // other hosts read the lanes as before.)
-            self.quad_read(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
-        } else {
-            self.read_lane(x, src)
-        };
-        let mut enable = None;
-        if let Some(inside) = inside {
-            if zero {
-                let z = k(self, 0);
-                r = self.s.m.select(c, inside, r, z);
-            } else {
-                enable = Some(inside);
-            }
-        }
-        if let Some((rows, banks)) = masks {
-            // Row (16 lanes) and bank (4 lanes of a row) write masks.
-            let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            // (in wave64 on 32-lane host waves rows 2 and 3 are lanes 32..63)
-            let row_lane = if self.exchange.is_some() || self.halves.is_some() {
-                self.console_lane()
-            } else {
-                lane
-            };
-            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
-            let ri = self.s.m.bin(c, Bin::And, ri, three);
-            let bi = self.s.m.bin(c, Bin::LShr, lane, two);
-            let bi = self.s.m.bin(c, Bin::And, bi, three);
-            let (rm, bm) = (k(self, u32::from(rows)), k(self, u32::from(banks)));
-            let rb = self.s.m.bin(c, Bin::LShr, rm, ri);
-            let bb = self.s.m.bin(c, Bin::LShr, bm, bi);
-            let both = self.s.m.bin(c, Bin::And, rb, bb);
-            let (one, z) = (k(self, 1), k(self, 0));
-            let both = self.s.m.bin(c, Bin::And, both, one);
-            let on = self.s.m.cmp(c, pred::NE, both, z);
-            enable = Some(match enable {
-                Some(e) => self.s.m.bin(c, Bin::And, e, on),
-                None => on,
-            });
-        }
-        Ok((r, enable))
     }
 
     fn valu_op(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
