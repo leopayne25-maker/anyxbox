@@ -44,8 +44,13 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice on the host texture.
     mips: u32,
+    /// Console mip index mapped to host mip 0 (`0` unless mip-clamped).
+    base_mip: u32,
+    /// Host texture mip-0 dimensions (`d.Width`, `d.Height`) when staged.
+    host_width: u64,
+    host_height: u32,
     /// The first of them that is uploaded, and the bytes of title memory
     /// read for it and the smaller ones.
     first: u32,
@@ -814,7 +819,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) && staged_from(resource) <= first {
+    if host_written || !list.first_use(resource as usize) && staged_covers(resource, texture, first) {
         return;
     }
     let Some(staging) = staging(resource, texture, first) else {
@@ -1441,6 +1446,7 @@ impl Staging {
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
+            let src_mip = self.base_mip + mip;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1448,16 +1454,16 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if mip < 32 && held & (1 << mip) == 0 {
+            if src_mip < 32 && held & (1 << src_mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
                 linear.fill(0);
                 continue;
             }
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, src_mip, slice, linear, pitch, pitch * rows as usize)
             {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+                tracing::warn!(?e, mip = src_mip, slice, "texture not detiled");
                 return;
             }
         }
@@ -1468,10 +1474,14 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
+    let _ = take_staged(resource);
+}
+
+/// Removes and returns a title texture's staging buffer so the caller can
+/// drop it outside locks.
+pub(crate) fn take_staged(resource: This) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
-    }
+    map.as_mut()?.remove(&(resource as usize))
 }
 
 /// Has the next list that uploads a title texture with a staging buffer
@@ -1576,13 +1586,20 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     Some((s.size as u64, committed(s.memory, s.size)))
 }
 
-/// The first mip a title texture's staging buffer holds; `u32::MAX` without
-/// one.
-fn staged_from(resource: This) -> u32 {
+/// Whether `resource`'s cached staging buffer already covers `texture`'s
+/// current host shape and console mips from `first` onward.
+fn staged_covers(resource: This, texture: &ID3D12Resource, first: u32) -> bool {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()
-        .and_then(|map| map.get(&(resource as usize)))
-        .map_or(u32::MAX, |s| s.first)
+    let Some(s) = map.as_ref().and_then(|m| m.get(&(resource as usize))) else {
+        return false;
+    };
+    let req_first = if s.on_demand { 0 } else { first.saturating_sub(s.base_mip) };
+    s.mips == u32::from(d.MipLevels)
+        && s.host_width == d.Width
+        && s.host_height == d.Height
+        && s.first <= req_first
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1748,20 +1765,28 @@ fn staged_part(layout: &victory_formats::texture::Layout, mips: u32, first: u32)
 }
 
 /// The staging state of a title texture from mip `first` on, made on first
-/// use (and made anew for larger mips than the one there holds).
+/// use (and made anew for larger mips or an upgraded host texture).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
-    // (Neptune) A texture made level by level stages every level (zeros for the ones the
-    // title does not hold): its upload gives the card's memory by the same answer.
-    let first = if on_demand { 0 } else { first };
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize))
-        && s.first <= first
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let host_mips = u32::from(d.MipLevels);
     {
-        return Some(s.clone());
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        if let Some(s) = map.get(&(resource as usize)) {
+            let req_first = if on_demand { 0 } else { first.saturating_sub(s.base_mip) };
+            if s.mips == host_mips
+                && s.host_width == d.Width
+                && s.host_height == d.Height
+                && s.on_demand == on_demand
+                && s.first <= req_first
+            {
+                return Some(s.clone());
+            }
+        }
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -1777,13 +1802,28 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         return None;
     }
     let host = host()?;
-    // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
-    let (first, size) = staged_part(&layout, u32::from(d.MipLevels), first);
-    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-        u32::from(d.MipLevels)
+    let base_mip = if on_demand {
+        0
     } else {
-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - first
+        (layout.mips.len() as u32).saturating_sub(host_mips)
+    };
+    let req_host_first = if on_demand { 0 } else { first.saturating_sub(base_mip) };
+    let (host_first, size) = if base_mip == 0 {
+        staged_part(&layout, host_mips, req_host_first)
+    } else {
+        let hf = if req_host_first < host_mips
+            && layout.bytes_from(base_mip + req_host_first) < layout.size
+        {
+            req_host_first
+        } else {
+            0
+        };
+        (hf, layout.bytes_from(base_mip + hf) as usize)
+    };
+    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        host_mips
+    } else {
+        host_mips * u32::from(d.DepthOrArraySize) - host_first
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
@@ -1792,7 +1832,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            first,
+            host_first,
             count,
             0,
             Some(footprints.as_mut_ptr()),
@@ -1819,8 +1859,11 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         footprints,
         rows,
         layout,
-        mips: u32::from(d.MipLevels),
-        first,
+        mips: host_mips,
+        base_mip,
+        host_width: d.Width,
+        host_height: d.Height,
+        first: host_first,
         size,
         bytes: total,
         memory,
@@ -1833,8 +1876,32 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
-    map.insert(resource as usize, s.clone());
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    // Never overwrite an already-upgraded higher-mip `Staging` (or one that
+    // stages sharper mips of the same host texture) with a racing stale entry.
+    if map.get(&(resource as usize)).is_none_or(|old| {
+        old.on_demand == on_demand
+            && (old.mips < host_mips || (old.mips == host_mips && host_first <= old.first))
+    }) {
+        map.insert(resource as usize, s.clone());
+    }
     Some(s)
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn staging_shape_for_test(
+    resource: This,
+    texture: &ID3D12Resource,
+) -> Option<(u32, u32, u32, u32)> {
+    let s = staging(resource, texture, 0)?;
+    Some((s.mips, s.base_mip, s.host_width as u32, s.host_height))
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn cached_staging_mips_for_test(resource: This) -> Option<u32> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    Some(map.as_ref()?.get(&(resource as usize))?.mips)
 }
 
 #[cfg(test)]
@@ -1875,6 +1942,56 @@ mod first_mip_tests {
         assert_eq!(crate::resource::first_mip(&[71, 4, 0x1688, 0, 4, 5, 0, 0, 0, 0]), 4);
         assert_eq!(crate::resource::first_mip(&[71, 5, 0x1688, 0, 4, 5, 0, 0, 0, 0]), 0, "an array view");
         assert_eq!(crate::resource::first_mip(&[71, 4, 0x1688, 0, 99, 5, 0, 0, 0, 0]), 15);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bc7_tail_mip_staging_hits_cache_without_rebuilding() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        // SAFETY: 5 u32 words match `#[repr(C)] HeapProperties` layout.
+        let props: crate::resource::HeapProperties =
+            unsafe { std::mem::transmute([1u32, 0, 0, 1, 1]) };
+        let iid = crate::object::guid(
+            0x6964_42be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        for (w, h, mips, first) in [(64u32, 64u32, 7u32, 5u32), (100, 100, 7, 1)] {
+            let words: [u32; 14] = [3, 0, 0, 0, w, 0, h, (mips << 16) | 1, 98, 1, 0, 0, 0, 0];
+            // SAFETY: 14 u32 words match `ResourceDesc` layout.
+            let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+            let mut tex = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_committed(
+                    std::ptr::null(),
+                    &props,
+                    0,
+                    &desc,
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut tex,
+                ),
+                0
+            );
+            let host_tex = crate::resource::host_resource(tex).expect("BC7 host texture");
+            let s1 = super::staging(tex, host_tex, first).expect("first BC7 staging");
+            let s2 = super::staging(tex, host_tex, first).expect("second BC7 staging");
+            assert!(
+                std::sync::Arc::ptr_eq(&s1, &s2),
+                "BC7 {w}x{h} first={first} staging must hit STAGING cache instead of rebuilding"
+            );
+            assert!(super::staged_covers(tex, host_tex, first));
+            // SAFETY: valid COM object returned by `create_committed`.
+            let release: extern "system" fn(crate::object::This) -> u32 = unsafe {
+                let vtable = *(tex as *const *const *const ());
+                std::mem::transmute(*vtable.add(2))
+            };
+            assert_eq!(release(tex), 0);
+        }
     }
 }
 

@@ -703,6 +703,31 @@ impl TextureQueue {
         }
     }
 
+    /// Re-queues an evicted non-tabled texture slot until `due` without adding
+    /// it to `self.held` (so [`TextureQueue::room`] on the next frame cannot
+    /// cancel the anti-thrash cooldown) and without bumping `self.writes` (so
+    /// evicted victims sort behind newly written title slots once `due` arrives).
+    fn hold_evicted(&mut self, index: u32, frame: u64, due: u64) {
+        self.held.remove(&index);
+        match self.slots.get_mut(&index) {
+            Some(w) => {
+                w.due = w.due.max(due);
+            }
+            None => {
+                self.slots.insert(
+                    index,
+                    Waiting {
+                        due,
+                        written: frame,
+                        write: 0,
+                        looks: 0,
+                        mapped: 0,
+                    },
+                );
+            }
+        }
+    }
+
     /// The card has room again at `frame`: the slots held back for lack of
     /// it are due now, as if they had never been held. Returns how many.
     fn room(&mut self, frame: u64) -> usize {
@@ -1757,6 +1782,104 @@ impl HostHeap {
                 })
             })
             .collect()
+    }
+
+    /// Nulls title-mirrored slots and clears untaken dynamic slots that retain
+    /// any raw `ID3D12Resource` pointer in `victims`, appending removed COM
+    /// references to `removed` so the caller drops them outside all locks.
+    /// Call only when no GPU submission is in flight.
+    pub(crate) fn evict_kept(
+        &self,
+        victims: &std::collections::HashSet<usize>,
+        frame: u64,
+        cooldown_frames: u64,
+        removed: &mut Vec<ID3D12Resource>,
+        shader_slots: &mut Vec<(usize, u32)>,
+    ) -> usize {
+        use windows::core::Interface;
+        if self.sampler || victims.is_empty() {
+            return 0;
+        }
+        let mut unmade = 0usize;
+        let mut rehold: Vec<u32> = Vec::new();
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let mut evicted_title: Vec<(u32, u64, bool)> = Vec::new();
+            for index in 0..self.count {
+                let Some(piece) = self.kept.get(index as usize) else {
+                    break;
+                };
+                let mut slot = piece.lock().unwrap_or_else(|e| e.into_inner());
+                if slot
+                    .as_ref()
+                    .is_some_and(|res| victims.contains(&(res.as_raw() as usize)))
+                {
+                    // Clear `made_too` (`Release`) and `made` BEFORE taking `slot` or
+                    // writing the null view so lock-free `mirror` readers fall through
+                    // to `self.made` and serialize after this unmake.
+                    let key = made.get_mut(index as usize).map(std::mem::take).unwrap_or(0);
+                    if let Some(too) = self.made_too.get(index as usize) {
+                        too.store(0, std::sync::atomic::Ordering::Release);
+                    }
+                    if let Some(old) = slot.take() {
+                        // SAFETY: `old` is a live owned `ID3D12Resource` COM reference.
+                        let is_texture_res =
+                            unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER;
+                        removed.push(old);
+                        evicted_title.push((index, key, is_texture_res));
+                    }
+                }
+            }
+            for (index, key, is_texture_res) in evicted_title {
+                unmade += 1;
+                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+                match &view {
+                    Some(v) => null_for(v, self.cpu(index)),
+                    None => null_view(self.cpu(index)),
+                }
+                if let Some(View::Shader(r, _)) = &view {
+                    shader_slots.push((*r, index));
+                }
+                let is_texture = match &view {
+                    Some(View::Placed(false, res, _)) => res[0] != 1,
+                    Some(View::Shader(..)) => is_texture_res,
+                    _ => false,
+                };
+                if is_texture && !self.tabled_lately(index, frame) {
+                    rehold.push(index);
+                }
+            }
+        }
+        if !rehold.is_empty() {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            let due = frame.saturating_add(cooldown_frames);
+            for index in rehold {
+                textures.hold_evicted(index, frame, due);
+            }
+        }
+        if self.dynamic > 0 {
+            let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            for dyn_idx in 0..self.dynamic as usize {
+                if guard.1.get(dyn_idx).copied().unwrap_or(true) {
+                    continue;
+                }
+                let index = self.count + dyn_idx as u32;
+                let Some(piece) = self.kept.get(index as usize) else {
+                    break;
+                };
+                let mut slot = piece.lock().unwrap_or_else(|e| e.into_inner());
+                if slot
+                    .as_ref()
+                    .is_some_and(|res| victims.contains(&(res.as_raw() as usize)))
+                    && let Some(old) = slot.take()
+                {
+                    null_view(self.cpu(index));
+                    removed.push(old);
+                    unmade += 1;
+                }
+            }
+        }
+        unmade
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -3187,7 +3310,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            if let Some((texture, base_mip)) = crate::resource::host_resource_with_base_mip(resource) {
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
                 // pad, then first level, levels, plane): each distinct one
@@ -3241,6 +3364,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         },
                     };
                     crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                }
+                if base_mip > 0
+                    && let Some(srv) = desc.as_mut()
+                {
+                    // SAFETY: a live resource.
+                    let own = unsafe { texture.GetDesc() };
+                    adjust_srv_for_base_mip(srv, base_mip, u32::from(own.MipLevels));
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -4248,5 +4378,292 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+/// Shifts an explicit 2D shader resource view description for a host texture
+/// created starting at console mip `base_mip` (`host_levels` mips on the host).
+pub(crate) fn adjust_srv_for_base_mip(
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+    base_mip: u32,
+    host_levels: u32,
+) {
+    if base_mip == 0 {
+        return;
+    }
+    let host_levels = host_levels.max(1);
+    let shift = |most: &mut u32, mips: &mut u32, lod: &mut f32| {
+        let orig_most = *most;
+        let orig_mips = *mips;
+        let new_most = orig_most.saturating_sub(base_mip).min(host_levels - 1);
+        let max_rem = host_levels - new_most;
+        let new_mips = if orig_mips == u32::MAX {
+            u32::MAX
+        } else {
+            let skipped = base_mip.saturating_sub(orig_most);
+            orig_mips.saturating_sub(skipped).clamp(1, max_rem)
+        };
+        let actual_mips = if new_mips == u32::MAX { max_rem } else { new_mips };
+        let max_lod = (new_most + actual_mips - 1) as f32;
+        let shifted = if lod.is_finite() {
+            *lod - base_mip as f32
+        } else {
+            0.0
+        };
+        *most = new_most;
+        *mips = new_mips;
+        *lod = shifted.clamp(0.0, max_lod);
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: active union variant matches `D3D12_SRV_DIMENSION_TEXTURE2D`.
+            let mut v = unsafe { desc.Anonymous.Texture2D };
+            shift(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            desc.Anonymous.Texture2D = v;
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: active union variant matches `D3D12_SRV_DIMENSION_TEXTURE2DARRAY`.
+            let mut v = unsafe { desc.Anonymous.Texture2DArray };
+            shift(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            desc.Anonymous.Texture2DArray = v;
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod mip_clamp_and_evict_kept_tests {
+    use super::*;
+    use windows::core::Interface;
+
+    #[test]
+    fn srv_adjustment_shifts_mips_and_clamps_lod_for_2d_and_2d_array() {
+        let make_2d = |most: u32, mips: u32, lod: f32| D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: most,
+                    MipLevels: mips,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: lod,
+                },
+            },
+        };
+
+        let mut whole = make_2d(0, u32::MAX, 0.0);
+        adjust_srv_for_base_mip(&mut whole, 2, 10);
+        // SAFETY: `Texture2D` union variant initialized above.
+        let v = unsafe { whole.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels, v.ResourceMinLODClamp), (0, u32::MAX, 0.0));
+
+        let mut full = make_2d(0, 12, 0.0);
+        adjust_srv_for_base_mip(&mut full, 2, 10);
+        // SAFETY: as above.
+        let v = unsafe { full.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels, v.ResourceMinLODClamp), (0, 10, 0.0));
+
+        let mut top_only = make_2d(0, 1, 0.5);
+        adjust_srv_for_base_mip(&mut top_only, 2, 10);
+        // SAFETY: as above.
+        let v = unsafe { top_only.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels, v.ResourceMinLODClamp), (0, 1, 0.0));
+
+        let mut partial = make_2d(1, 4, 2.5);
+        adjust_srv_for_base_mip(&mut partial, 2, 10);
+        // SAFETY: as above.
+        let v = unsafe { partial.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels, v.ResourceMinLODClamp), (0, 3, 0.5));
+
+        let mut inner = make_2d(4, 3, 5.25);
+        adjust_srv_for_base_mip(&mut inner, 2, 10);
+        // SAFETY: as above.
+        let v = unsafe { inner.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels, v.ResourceMinLODClamp), (2, 3, 3.25));
+
+        let mut arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 3,
+                    MipLevels: 2,
+                    FirstArraySlice: 0,
+                    ArraySize: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 99.0,
+                },
+            },
+        };
+        adjust_srv_for_base_mip(&mut arr, 2, 8);
+        // SAFETY: `Texture2DArray` union variant initialized above.
+        let va = unsafe { arr.Anonymous.Texture2DArray };
+        assert_eq!((va.MostDetailedMip, va.MipLevels, va.ResourceMinLODClamp), (1, 2, 2.0));
+    }
+
+    #[test]
+    fn evict_kept_nulls_title_and_untaken_dynamic_slots_while_preserving_taken_slots() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let make_small_tex = || {
+            let props = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: plain D3D12 committed texture creation.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &props,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        None,
+                        &mut out,
+                    )
+                    .expect("small D3D12 texture");
+            }
+            out.unwrap()
+        };
+
+        let tex_victim = make_small_tex();
+        let tex_taken = make_small_tex();
+        assert_eq!(crate::host::references(&tex_victim), 1);
+        assert_eq!(crate::host::references(&tex_taken), 1);
+
+        {
+            let mut made = heap.made.lock().unwrap_or_else(|e| e.into_inner());
+            made[3] = 0x1_0000_0001;
+            heap.made_too[3].store(0x1_0000_0001, std::sync::atomic::Ordering::Release);
+        }
+        heap.keep(3, Some(tex_victim.clone()));
+
+        let dyn_freed = heap.dynamic(2).unwrap();
+        heap.keep(dyn_freed, Some(tex_victim.clone()));
+        heap.release(dyn_freed, 2);
+
+        let dyn_live = heap.dynamic(1).unwrap();
+        heap.keep(dyn_live, Some(tex_taken.clone()));
+
+        assert_eq!(crate::host::references(&tex_victim), 3);
+        assert_eq!(crate::host::references(&tex_taken), 2);
+
+        let victims: std::collections::HashSet<usize> = [
+            tex_victim.as_raw() as usize,
+            tex_taken.as_raw() as usize,
+        ]
+        .into_iter()
+        .collect();
+        let mut removed = Vec::new();
+        let mut shader_slots = Vec::new();
+        let unmade = heap.evict_kept(&victims, 10, 60, &mut removed, &mut shader_slots);
+        assert_eq!(unmade, 2, "title slot 3 + untaken dynamic slot must be unmade");
+        assert_eq!(heap.made_too[3].load(std::sync::atomic::Ordering::Acquire), 0);
+        drop(removed);
+
+        assert_eq!(crate::host::references(&tex_victim), 1);
+        assert_eq!(crate::host::references(&tex_taken), 2);
+
+        heap.release(dyn_live, 1);
+        let mut removed_after = Vec::new();
+        assert_eq!(
+            heap.evict_kept(&victims, 11, 60, &mut removed_after, &mut shader_slots),
+            1
+        );
+        drop(removed_after);
+        assert_eq!(crate::host::references(&tex_taken), 1);
+    }
+
+    #[test]
+    fn evicted_slot_cooldown_is_not_cancelled_by_texture_slots_room_and_trails_fresh_writes() {
+        let mut q = TextureQueue::default();
+        q.written(5, 10, 10, false);
+        let w5 = q.slots[&5].write;
+        q.hold(5, w5, 50);
+        q.hold_evicted(5, 10, 250);
+        q.hold_evicted(7, 10, 250);
+        assert_eq!(q.room(11), 0);
+        assert!(q.due(11, 16).is_empty());
+        assert!(q.due(249, 16).is_empty());
+
+        q.written(9, 200, 200, false);
+        let order: Vec<u32> = q.due(250, 16).into_iter().map(|(idx, _)| idx).collect();
+        assert_eq!(order[0], 9, "fresh title write must be served before cooled-down evicted slots");
+        assert!(order.contains(&5) && order.contains(&7));
+
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut victim: Option<ID3D12Resource> = None;
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    None,
+                    &mut victim,
+                )
+                .unwrap();
+        }
+        let victim = victim.unwrap();
+        let mut placed_res = [0u32; 14];
+        placed_res[0] = 3; // TEXTURE_2D
+        let view = View::Placed(false, placed_res, [0u32; 16]);
+        let [vi, vg] = super::super::words_for(view);
+        let key = u64::from(vg) << 32 | u64::from(vi);
+        {
+            let mut made = heap.made.lock().unwrap_or_else(|e| e.into_inner());
+            made[2] = key;
+            heap.made_too[2].store(key, std::sync::atomic::Ordering::Release);
+        }
+        heap.keep(2, Some(victim.clone()));
+
+        let victims: std::collections::HashSet<usize> =
+            [victim.as_raw() as usize].into_iter().collect();
+        let mut removed = Vec::new();
+        let mut shader_slots = Vec::new();
+        assert_eq!(heap.evict_kept(&victims, 100, 240, &mut removed, &mut shader_slots), 1);
+        drop(removed);
+
+        assert_eq!(heap.texture_slots_room(101), 0);
+        assert!(heap.texture_slots_due(101, 16).0.is_empty());
+        assert!(heap.texture_slots_due(339, 16).0.is_empty());
+        assert_eq!(heap.texture_slots_due(340, 16).0.len(), 1);
     }
 }
