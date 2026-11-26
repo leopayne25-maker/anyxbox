@@ -1047,7 +1047,7 @@ pub struct Texture {
 
 impl Texture {
     pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
-        Texture::build(desc, |d| Layout::new(d))
+        Texture::build(desc, Layout::new)
     }
 
     /// The texture with addressing for the XOR modes ([`Layout::for_gpu`]);
