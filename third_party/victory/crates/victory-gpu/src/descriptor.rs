@@ -28,10 +28,10 @@ const HEAP_IIDS: [Iid; 4] = [
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapDesc {
-    kind: u32,
-    count: u32,
-    flags: u32,
-    nodes: u32,
+    pub(crate) kind: u32,
+    pub(crate) count: u32,
+    pub(crate) flags: u32,
+    pub(crate) nodes: u32,
 }
 
 /// Newer titles (the title) pass the description followed by
@@ -903,6 +903,118 @@ pub(crate) fn make_waiting() {
             }
         }
     }
+}
+
+/// Unmakes shader-visible title slots and clears untaken dynamic slots that
+/// retain any host resource pointer in `victims`, retiring all released COM
+/// references outside every lock and returning `(unmade_slots, shader_resources)`
+/// registered in [`WAITING`]. Call only under `Host::submitted` when no GPU
+/// submission is in flight.
+#[cfg(windows)]
+pub(crate) fn evict_kept_resources(
+    victims: &std::collections::HashSet<usize>,
+    frame: u64,
+    cooldown_frames: u64,
+) -> (usize, Vec<usize>) {
+    evict_kept_resources_with(victims, frame, cooldown_frames, 0)
+}
+
+#[cfg(windows)]
+pub(crate) fn evict_kept_resources_with(
+    victims: &std::collections::HashSet<usize>,
+    frame: u64,
+    cooldown_frames: u64,
+    min_idle_frames: u64,
+) -> (usize, Vec<usize>) {
+    if victims.is_empty() {
+        return (0, Vec::new());
+    }
+    let mut removed = Vec::new();
+    let mut waits: Vec<(usize, u64)> = Vec::new();
+    let mut unmade = 0usize;
+    {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed under lock in `Drop`).
+            let heap = unsafe { &*(at as *const Heap) };
+            let Some(Some(host)) = heap.host.get() else {
+                continue;
+            };
+            let mut shader_slots = Vec::new();
+            unmade += host.evict_kept_with(
+                victims,
+                frame,
+                cooldown_frames,
+                min_idle_frames,
+                &mut removed,
+                &mut shader_slots,
+            );
+            for (resource, index) in shader_slots {
+                if let Some(handle) = heap.handle(index) {
+                    waits.push((resource, handle));
+                }
+            }
+        }
+    }
+    let mut resources = Vec::new();
+    if !waits.is_empty() {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        for (resource, handle) in waits {
+            let slots = waiting.entry(resource).or_default();
+            if !slots.contains(&handle) {
+                slots.push(handle);
+            }
+            if !resources.contains(&resource) {
+                resources.push(resource);
+            }
+        }
+    }
+    host::release_yielded_resources(removed);
+    (unmade, resources)
+}
+
+/// Yields superseded `keep_views` slots across all live shader heaps under
+/// VRAM pressure, releasing displaced older textures outside all locks so their
+/// COM reference counts drop to 1 for immediate LRU eviction.
+#[cfg(windows)]
+pub(crate) fn yield_kept_views() -> usize {
+    if !host::kept_views_yield() {
+        return 0;
+    }
+    let mut removed = Vec::new();
+    let mut unmade = 0usize;
+    {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed under lock in `Drop`).
+            let heap = unsafe { &*(at as *const Heap) };
+            let Some(Some(host)) = heap.host.get() else {
+                continue;
+            };
+            unmade += host.yield_kept_views_into(&mut removed);
+        }
+    }
+    host::release_yielded_resources(removed);
+    unmade
+}
+
+/// Collects per-resource recency across every live shader heap's `kept` slots.
+#[cfg(windows)]
+pub(crate) fn heap_resource_recency(
+    frame: u64,
+    min_idle_frames: u64,
+) -> std::collections::HashMap<usize, host::HeapResourceRecency> {
+    let mut recency = std::collections::HashMap::new();
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed under lock in `Drop`).
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(Some(host)) = heap.host.get() else {
+            continue;
+        };
+        host.collect_resource_recency(frame, min_idle_frames, &mut recency);
+    }
+    recency
 }
 
 fn record(handle: u64, view: View) {
