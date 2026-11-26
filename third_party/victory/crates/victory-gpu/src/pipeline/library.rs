@@ -210,6 +210,10 @@ impl Blob {
     /// ([`NEXT_FILE`]) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
         let path = dir.join(LIBRARY_FILE);
+        let tmp = path.with_extension("tmp");
+        if tmp.exists() {
+            let _ = std::fs::remove_file(&tmp);
+        }
         let next = dir.join(NEXT_FILE);
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
@@ -668,11 +672,15 @@ pub(crate) fn save(now: bool) {
 /// `VICTORY_LIBRARY_MAP=0`).
 fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usize) -> std::io::Result<()> {
     let failed = |e: windows::core::Error| std::io::Error::other(e.to_string());
-    if mapped()
-        && let Some(mut file) = Mapped::create(tmp, size)
-    {
-        // SAFETY: a buffer of the size the library asks for.
-        return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
+    if mapped() {
+        if let Some(mut file) = Mapped::create(tmp, size) {
+            // SAFETY: a buffer of the size the library asks for.
+            return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
+        }
+        tracing::warn!(
+            size,
+            "host pipeline library mapping failed; falling back to heap buffer"
+        );
     }
     let mut bytes = vec![0u8; size];
     // SAFETY: a buffer of the size the library asks for.
@@ -941,5 +949,19 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn opening_a_cache_dir_cleans_up_orphaned_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let tmp = path.with_extension("tmp");
+        let next = dir.path().join(NEXT_FILE);
+        std::fs::write(&tmp, b"orphaned partial save").unwrap();
+        std::fs::write(&next, b"promoted library").unwrap();
+        let blob = Blob::of(dir.path());
+        assert!(!tmp.exists(), "orphaned host-pipelines.tmp should be removed on open");
+        assert!(!next.exists(), "host-pipelines.next should be promoted to host-pipelines.bin");
+        assert_eq!(blob.bytes(), b"promoted library");
     }
 }
