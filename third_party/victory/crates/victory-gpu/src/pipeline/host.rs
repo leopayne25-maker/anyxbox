@@ -128,23 +128,30 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
 /// others keep theirs.
 fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
     let count = (targets.NumRenderTargets as usize).min(8);
-    let per_target = blend.IndependentBlendEnable.as_bool();
-    let blends = |i: usize| {
-        blend.RenderTarget[if per_target { i } else { 0 }]
-            .BlendEnable
-            .as_bool()
-    };
-    if !(0..count).any(|i| integer_format(targets.RTFormats[i]) && blends(i)) {
-        return *blend;
-    }
+    let formats = &targets.RTFormats[..count];
     let mut host = *blend;
-    if !per_target {
-        host.IndependentBlendEnable = true.into();
-        host.RenderTarget = [blend.RenderTarget[0]; 8];
+    let first = host.RenderTarget[0];
+    if !host.IndependentBlendEnable.as_bool()
+        && (first.BlendEnable.as_bool() || first.LogicOpEnable.as_bool())
+        && formats.iter().copied().any(integer_format)
+    {
+        if formats.iter().any(|&f| f != DXGI_FORMAT_UNKNOWN && !integer_format(f)) {
+            host.IndependentBlendEnable = true.into();
+            host.RenderTarget[..count].fill(first);
+        } else {
+            host.RenderTarget[0].BlendEnable = false.into();
+            host.RenderTarget[0].LogicOpEnable = false.into();
+        }
     }
-    for i in 0..count {
-        if integer_format(targets.RTFormats[i]) {
-            host.RenderTarget[i].BlendEnable = false.into();
+    if host.IndependentBlendEnable.as_bool() {
+        // Even unused slots must have LogicOpEnable off with independent blending.
+        for target in &mut host.RenderTarget {
+            target.LogicOpEnable = false.into();
+        }
+        for (target, &format) in host.RenderTarget.iter_mut().zip(formats) {
+            if integer_format(format) {
+                target.BlendEnable = false.into();
+            }
         }
     }
     host
@@ -228,10 +235,15 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
+                    self.targets.NumRenderTargets = self.targets.NumRenderTargets.min(8);
+                    let count = self.targets.NumRenderTargets as usize;
+                    for f in &mut self.targets.RTFormats[..count] {
                         f.0 = crate::resource::target_format(crate::resource::pc_format(
                             f.0 as u32,
                         )) as i32;
+                    }
+                    for f in &mut self.targets.RTFormats[count..] {
+                        *f = DXGI_FORMAT_UNKNOWN;
                     }
                 }
                 16 => {
@@ -1523,5 +1535,362 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    fn compile_fxc(src: &str, profile: &[u8]) -> Vec<u8> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: static source and null-terminated profile string.
+        let compiled = unsafe {
+            D3DCompile(
+                src.as_ptr().cast(),
+                src.len(),
+                PCSTR(c"pso_test".as_ptr().cast()),
+                None,
+                None,
+                PCSTR(c"main".as_ptr().cast()),
+                PCSTR(profile.as_ptr()),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            let msg = errors
+                .map(|b| {
+                    // SAFETY: error blob bytes.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+                    };
+                    String::from_utf8_lossy(bytes).into_owned()
+                })
+                .unwrap_or_default();
+            panic!("D3DCompile failed ({e}): {msg}");
+        }
+        let blob = code.expect("compiled shader");
+        // SAFETY: compiled DXBC blob bytes.
+        unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        }
+        .to_vec()
+    }
+
+    fn make_rt_tex(host: &crate::host::Host, format: DXGI_FORMAT) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let rd = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut out: Option<ID3D12Resource> = None;
+        // SAFETY: valid heap and texture description.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &rd,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut out,
+                )
+                .expect("render target texture");
+        }
+        out.unwrap()
+    }
+
+    fn readback_pixel(host: &crate::host::Host, list: &crate::host::HostList, tex: &ID3D12Resource, format: DXGI_FORMAT) -> ID3D12Resource {
+        let readback = host.read_back_buffer(1024).expect("readback buffer");
+        // SAFETY: open list, live render target and readback buffer.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                tex,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: format,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(tex),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                tex,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )]);
+        }
+        readback
+    }
+
+    fn map_first_byte(readback: &ID3D12Resource) -> u8 {
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: submission finished; buffer holds at least 1024 bytes.
+        unsafe {
+            readback.Map(0, None, Some(&mut ptr)).expect("map readback");
+            let v = *ptr.cast::<u8>();
+            readback.Unmap(0, None);
+            v
+        }
+    }
+
+    fn make_graphics_pso(
+        device: &ID3D12Device,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        ps: &[u8],
+        g: &GraphicsState,
+    ) -> windows::core::Result<ID3D12PipelineState> {
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed pointer, never released by the descriptor.
+            pRootSignature: unsafe { std::mem::transmute_copy(root) },
+            VS: code(vs),
+            PS: code(ps),
+            BlendState: host_blend(&g.blend, &g.targets),
+            SampleMask: g.sample_mask,
+            RasterizerState: g.rasterizer,
+            DepthStencilState: g.depth,
+            IBStripCutValue: g.strip_cut,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: g.targets.NumRenderTargets,
+            RTVFormats: g.targets.RTFormats,
+            DSVFormat: g.depth_format,
+            SampleDesc: g.samples,
+            ..Default::default()
+        };
+        // SAFETY: live root signature and bytecode slices.
+        unsafe { device.CreateGraphicsPipelineState(&desc) }
+    }
+
+    /// `host_blend` previously set `IndependentBlendEnable = true` and copied
+    /// `RenderTarget[0]` (with `LogicOpEnable = true`) into slots `1..8`, then
+    /// cleared `LogicOpEnable` only on integer slots. That left `LogicOpEnable`
+    /// enabled while `IndependentBlendEnable` was true, causing D3D12 to reject
+    /// both single-target integer PSOs and mixed float+integer PSOs with
+    /// `E_INVALIDARG`.
+    #[test]
+    fn host_blend_with_logic_op_and_integer_rt_creates_valid_pso_and_draws() {
+        let Some(host) = host() else {
+            return;
+        };
+        let vs = compile_fxc(VS, b"vs_5_1\0");
+        let ps_uint = compile_fxc("uint main() : SV_Target { return 42u; }", b"ps_5_1\0");
+        let ps_mixed = compile_fxc(
+            "struct Out { float4 c : SV_Target0; uint m : SV_Target1; };
+             Out main() { Out o; o.c = float4(1, 0, 0, 1); o.m = 77u; return o; }",
+            b"ps_5_1\0",
+        );
+        let (root, _) = root_signature(&host.device, &[], &[], false).expect("root sig");
+
+        // Case A: single R8_UINT render target with LogicOpEnable = true and IndependentBlendEnable = false.
+        let mut g1 = GraphicsState::default();
+        g1.depth.DepthEnable = false.into();
+        g1.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        g1.blend.IndependentBlendEnable = false.into();
+        g1.blend.RenderTarget[0].BlendEnable = false.into();
+        g1.blend.RenderTarget[0].LogicOpEnable = true.into();
+        g1.blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_COPY;
+        g1.targets.NumRenderTargets = 1;
+        g1.targets.RTFormats[0] = DXGI_FORMAT_R8_UINT;
+        let pso1 = make_graphics_pso(&host.device, &root, &vs, &ps_uint, &g1)
+            .expect("single R8_UINT PSO with LogicOpEnable must not be rejected");
+
+        // Execute a real GPU draw with pso1 and verify output texel == 42.
+        let rt_uint = make_rt_tex(host, DXGI_FORMAT_R8_UINT);
+        let list = host.new_list().expect("list");
+        let rtv = host.rtv(Some(&rt_uint), None);
+        let vp = D3D12_VIEWPORT { Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default() };
+        let rect = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 4, bottom: 4 };
+        // SAFETY: open list, live resources.
+        unsafe {
+            list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.list.RSSetViewports(&[vp]);
+            list.list.RSSetScissorRects(&[rect]);
+            list.list.SetGraphicsRootSignature(&root);
+            list.list.SetPipelineState(&pso1);
+            list.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.list.DrawInstanced(3, 1, 0, 0);
+        }
+        let rb1 = readback_pixel(host, &list, &rt_uint, DXGI_FORMAT_R8_UINT);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(map_first_byte(&rb1), 42, "R8_UINT draw must write 42");
+
+        // Case B: mixed [R8G8B8A8_UNORM, R8_UINT] with LogicOpEnable = true and IndependentBlendEnable = false.
+        let mut g2 = g1;
+        g2.targets.NumRenderTargets = 2;
+        g2.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g2.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        let pso2 = make_graphics_pso(&host.device, &root, &vs, &ps_mixed, &g2)
+            .expect("mixed UNORM+UINT PSO with LogicOpEnable must not be rejected");
+
+        let rt_color = make_rt_tex(host, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let list2 = host.new_list().expect("list2");
+        let rtvs = [host.rtv(Some(&rt_color), None), host.rtv(Some(&rt_uint), None)];
+        // SAFETY: open list, live resources.
+        unsafe {
+            list2.list.ClearRenderTargetView(rtvs[0], &[0.0; 4], None);
+            list2.list.ClearRenderTargetView(rtvs[1], &[0.0; 4], None);
+            list2.list.OMSetRenderTargets(2, Some(rtvs.as_ptr()), false, None);
+            list2.list.RSSetViewports(&[vp]);
+            list2.list.RSSetScissorRects(&[rect]);
+            list2.list.SetGraphicsRootSignature(&root);
+            list2.list.SetPipelineState(&pso2);
+            list2.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list2.list.DrawInstanced(3, 1, 0, 0);
+        }
+        let rb_color = readback_pixel(host, &list2, &rt_color, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let rb_mask = readback_pixel(host, &list2, &rt_uint, DXGI_FORMAT_R8_UINT);
+        list2.close();
+        host.execute(&[&list2]);
+        assert_eq!(map_first_byte(&rb_color), 255, "RT0 UNORM red channel must be 255");
+        assert_eq!(map_first_byte(&rb_mask), 77, "RT1 R8_UINT must be 77");
+    }
+
+    /// Reused console pipeline stream structs can leave stale non-zero formats
+    /// in `RTFormats[NumRenderTargets..8]`. D3D12 rejects any PSO with a
+    /// non-`DXGI_FORMAT_UNKNOWN` format past `NumRenderTargets`, so
+    /// `GraphicsState::read` must clear those unused slots.
+    #[test]
+    fn rt_format_array_clears_stale_formats_past_num_render_targets() {
+        let Some(host) = host() else {
+            return;
+        };
+        let vs = compile_fxc(VS, b"vs_5_1\0");
+        let ps = compile_fxc(PS, b"ps_5_1\0");
+        let (root, _) = root_signature(&host.device, &[], &[], false).expect("root sig");
+
+        #[repr(C, align(8))]
+        struct Sub15(u32, D3D12_RT_FORMAT_ARRAY);
+        let mut rts = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: 1,
+            RTFormats: [DXGI_FORMAT_UNKNOWN; 8],
+        };
+        rts.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // Stale leftover formats past NumRenderTargets = 1.
+        rts.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        rts.RTFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let sub = Sub15(15, rts);
+
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        // SAFETY: `sub` is a complete subobject 15.
+        unsafe { g.read(15, (&raw const sub).cast()) };
+        let pso = make_graphics_pso(&host.device, &root, &vs, &ps, &g)
+            .expect("PSO with stale formats cleared past NumRenderTargets must succeed");
+        assert_eq!(g.targets.NumRenderTargets, 1);
+        assert_eq!(g.targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(g.targets.RTFormats[1], DXGI_FORMAT_UNKNOWN);
+        assert_eq!(g.targets.RTFormats[2], DXGI_FORMAT_UNKNOWN);
+        let rt = make_rt_tex(host, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let list = host.new_list().expect("list");
+        let rtv = host.rtv(Some(&rt), None);
+        let vp = D3D12_VIEWPORT { Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default() };
+        let rect = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 4, bottom: 4 };
+        // SAFETY: open list, live resources.
+        unsafe {
+            list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.list.RSSetViewports(&[vp]);
+            list.list.RSSetScissorRects(&[rect]);
+            list.list.SetGraphicsRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.list.DrawInstanced(3, 1, 0, 0);
+        }
+        let rb = readback_pixel(host, &list, &rt, DXGI_FORMAT_R8G8B8A8_UNORM);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(map_first_byte(&rb), 255);
+    }
+
+    /// With a blendable UNORM target alongside an integer target and
+    /// `IndependentBlendEnable = false`, `host_blend` must preserve blending on
+    /// the UNORM target while turning it off on the integer target.
+    #[test]
+    fn host_blend_preserves_unorm_blending_alongside_integer_target() {
+        let Some(host) = host() else {
+            return;
+        };
+        let vs = compile_fxc(VS, b"vs_5_1\0");
+        let ps = compile_fxc(
+            "struct Out { float4 c : SV_Target0; uint m : SV_Target1; };
+             Out main() { Out o; o.c = float4(0.25, 0, 0, 1); o.m = 9u; return o; }",
+            b"ps_5_1\0",
+        );
+        let (root, _) = root_signature(&host.device, &[], &[], false).expect("root sig");
+
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+        g.blend.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+        g.blend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+
+        let pso = make_graphics_pso(&host.device, &root, &vs, &ps, &g)
+            .expect("mixed additive UNORM + integer PSO must succeed");
+        let rt_color = make_rt_tex(host, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let rt_uint = make_rt_tex(host, DXGI_FORMAT_R8_UINT);
+        let list = host.new_list().expect("list");
+        let rtvs = [host.rtv(Some(&rt_color), None), host.rtv(Some(&rt_uint), None)];
+        let vp = D3D12_VIEWPORT { Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default() };
+        let rect = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 4, bottom: 4 };
+        // SAFETY: open list, live resources.
+        unsafe {
+            list.list.ClearRenderTargetView(rtvs[0], &[0.0; 4], None);
+            list.list.ClearRenderTargetView(rtvs[1], &[0.0; 4], None);
+            list.list.OMSetRenderTargets(2, Some(rtvs.as_ptr()), false, None);
+            list.list.RSSetViewports(&[vp]);
+            list.list.RSSetScissorRects(&[rect]);
+            list.list.SetGraphicsRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.list.DrawInstanced(3, 1, 0, 0);
+            list.list.DrawInstanced(3, 1, 0, 0);
+        }
+        let rb_color = readback_pixel(host, &list, &rt_color, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let rb_uint = readback_pixel(host, &list, &rt_uint, DXGI_FORMAT_R8_UINT);
+        list.close();
+        host.execute(&[&list]);
+        let red = map_first_byte(&rb_color);
+        assert!(
+            (126..=129).contains(&red),
+            "two additive 0.25 draws into UNORM target must blend to ~128 (got {red})"
+        );
+        assert_eq!(map_first_byte(&rb_uint), 9, "integer target must receive unblended 9");
     }
 }
