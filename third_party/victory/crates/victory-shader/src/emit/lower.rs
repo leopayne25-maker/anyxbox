@@ -3341,9 +3341,25 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
+        let mut f = self.fsrc_unmodified(inst, k)?;
+        if v.abs >> k & 1 != 0 {
+            f = self.unary(6, f);
+        }
+        if v.neg >> k & 1 != 0 {
+            let z = self.s.m.f32(0x8000_0000);
+            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
+        }
+        Ok(f)
+    }
+
+    /// The selected f32 source before abs and neg.
+    fn fsrc_unmodified(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let selected = Self::sdwa_src(inst, k);
-        let mut f = match op {
+        Ok(match op {
             _ if selected.is_some() => {
                 let (sel, sext) = selected.expect("checked");
                 let x = self.operand(inst, &op)?;
@@ -3375,15 +3391,7 @@ impl<'a> Lower<'a> {
                 let x = self.operand(inst, &op)?;
                 self.as_float(x)
             }
-        };
-        if v.abs >> k & 1 != 0 {
-            f = self.unary(6, f);
-        }
-        if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
-        }
-        Ok(f)
+        })
     }
 
     fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
@@ -7319,23 +7327,51 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
-            "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
-                let mut a = f(self, 0)?;
-                if name == "v_cvt_rpi_i32_f32" {
-                    let h = self.s.m.f32(0.5f32.to_bits());
-                    a = self.s.m.bin(c, Bin::Add, a, h);
-                }
-                if name != "v_cvt_i32_f32" && name != "v_cvt_u32_f32" {
-                    a = self.unary(27, a);
-                }
-                // D3D's conversions saturate and give 0 for NaN, as the
-                // hardware does (checked on the RX 6700 XT and WARP).
+            "v_cvt_i32_f32" | "v_cvt_u32_f32" => {
+                let a = f(self, 0)?;
+                // The truncating RDNA2 conversions share D3D's NaN-to-zero rule.
                 let op = if name == "v_cvt_u32_f32" {
                     Cast::FpToUi
                 } else {
                     Cast::FpToSi
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
+                int(self, r)
+            }
+            "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
+                let a = self.fsrc_unmodified(inst, 0)?;
+                let mut bits = self.as_int(a);
+                let sign = self.s.m.i32(0x8000_0000);
+                let magnitude_mask = self.s.m.i32(0x7fff_ffff);
+                // Apply the source modifiers to its bits so NaN saturation sees the modified sign.
+                if v.abs & 1 != 0 {
+                    bits = self.s.m.bin(c, Bin::And, bits, magnitude_mask);
+                }
+                if v.neg & 1 != 0 {
+                    bits = self.s.m.bin(c, Bin::Xor, bits, sign);
+                }
+                let a = self.as_float(bits);
+                let floor = self.unary(27, a);
+                let rounded = if name == "v_cvt_rpi_i32_f32" {
+                    // Compare the fraction to the halfway point before rounding.
+                    let fraction = self.s.m.bin(c, Bin::Sub, a, floor);
+                    let half = self.s.m.f32(0.5f32.to_bits());
+                    let up = self.s.m.cmp(c, pred::OGE, fraction, half);
+                    let one = self.s.m.f32(1.0f32.to_bits());
+                    let next = self.s.m.bin(c, Bin::Add, floor, one);
+                    self.s.m.select(c, up, next, floor)
+                } else {
+                    floor
+                };
+                let converted = self.s.m.cast(c, Cast::FpToSi, rounded, self.s.t.i32);
+                // gfx1036 measurements in Marvisak/VIctory#605 give signed saturation for NaN.
+                let magnitude = self.s.m.bin(c, Bin::And, bits, magnitude_mask);
+                let infinity = self.s.m.i32(f32::INFINITY.to_bits());
+                let nan = self.s.m.cmp(c, pred::IUGT, magnitude, infinity);
+                let zero = self.s.m.i32(0);
+                let negative = self.s.m.cmp(c, pred::SLT, bits, zero);
+                let saturated = self.s.m.select(c, negative, sign, magnitude_mask);
+                let r = self.s.m.select(c, nan, saturated, converted);
                 int(self, r)
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {

@@ -1426,6 +1426,71 @@ fn v_cmp_class_f16_matches_rdna2() {
 }
 
 #[test]
+fn rounded_f32_to_i32_matches_rdna2_at_halfway_and_large_integers() {
+    // Expected results for RPI and FLR, respectively.
+    let cases = [
+        (0x3eff_ffff, [0, 0]), // immediately below +0.5
+        (0x3f00_0000, [1, 0]),
+        (0x3f00_0001, [1, 0]),
+        (0xbeff_ffff, [0, -1]), // immediately above -0.5
+        (0xbf00_0000, [0, -1]),
+        (0xbf00_0001, [-1, -1]),
+        ((-1.5f32).to_bits(), [-1, -2]),
+        (0x4aff_ffff, [0x0080_0000, 0x007f_ffff]), // 2^23 - 0.5
+        (0x4b00_0001, [0x0080_0001, 0x0080_0001]),
+        (0x4b7f_ffff, [0x00ff_ffff, 0x00ff_ffff]),
+        (0xcb00_0001, [-0x0080_0001, -0x0080_0001]),
+        (0x4eff_ffff, [0x7fff_ff80, 0x7fff_ff80]), // largest f32 below i32::MAX
+        (0x4f00_0000, [i32::MAX, i32::MAX]),
+        (0xcf00_0000, [i32::MIN, i32::MIN]),
+        (f32::INFINITY.to_bits(), [i32::MAX, i32::MAX]),
+        (f32::NEG_INFINITY.to_bits(), [i32::MIN, i32::MIN]),
+    ];
+    let inputs: Vec<_> = cases.iter().map(|&(bits, _)| [bits, 0, 0, 0]).collect();
+    for (mode, (op, name)) in [(0x00c, "RPI"), (0x00d, "FLR")].into_iter().enumerate() {
+        let short = [vop1(op, 0, vgpr(1))];
+        let wide = vop3(0x180 + op, 0, vgpr(1), 0x80, 0x80);
+        for (encoding, body) in [("VOP1", short.as_slice()), ("VOP3", wide.as_slice())] {
+            let shader = build_valu_cs(body);
+            run_cases(&shader, &inputs, |backend, i, [bits, ..], got| {
+                assert_eq!(got as i32, cases[i].1[mode], "{backend}: {encoding} {name} of {bits:#010x}");
+            });
+        }
+    }
+}
+
+#[test]
+fn rounded_f32_to_i32_saturates_nan_with_its_modified_sign() {
+    let inputs = [
+        [0x7fc0_0000, 0, 0, 0], // +qNaN
+        [0xffc1_0000, 0, 0, 0], // -qNaN
+        [0x7f80_0001, 0, 0, 0], // +sNaN
+        [0xff80_0001, 0, 0, 0], // -sNaN
+    ];
+    for (op, name) in [(0x00c, "RPI"), (0x00d, "FLR")] {
+        let check = |body: &[u32], abs, neg| {
+            let shader = build_valu_cs(body);
+            run_cases(&shader, &inputs, |backend, _, [bits, ..], got| {
+                let negative = (bits >> 31 != 0 && abs == 0) ^ (neg != 0);
+                let expected = if negative { i32::MIN } else { i32::MAX };
+                assert_eq!(got as i32, expected, "{backend}: {name} of {bits:#010x}, abs {abs}, neg {neg}");
+            });
+        };
+        check(&[vop1(op, 0, vgpr(1))], 0, 0);
+        for (abs, neg) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            check(&vop3_mod(0x180 + op, 0, vgpr(1), 0x80, 0x80, abs, neg, 0, false), abs, neg);
+        }
+    }
+    // Plain truncating conversions use zero for NaN.
+    for op in [0x007, 0x008] {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        run_cases(&shader, &inputs, |backend, _, [bits, ..], got| {
+            assert_eq!(got, 0, "{backend}: truncating opcode {op:#x} of {bits:#010x}");
+        });
+    }
+}
+
+#[test]
 fn v_cvt_f32_f64_matches_ieee754() {
     // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f -> VOP3 opcode 0x18f).
     let plain = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
