@@ -60,6 +60,10 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The last submission (`crate::host` numbers; 0: none yet) whose lists
+    /// copy from the staging buffer. Until the card has run it, the buffer
+    /// is not written ([`copy_in_flight`]).
+    copied_by: std::sync::atomic::AtomicU64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
@@ -427,6 +431,59 @@ impl Drop for Staging {
     }
 }
 
+/// Whether a staging buffer is left alone while a submission that copies
+/// from it may still be on the card (`VICTORY_STAGING_GUARD=0`: it is
+/// written whenever a texture refresh finds the texture changed, as before;
+/// on by default).
+///
+/// A list that samples a texture whose staging buffer is newer than the
+/// host texture records a copy from the buffer; the buffer is brought up to
+/// date while that list's submission is prepared, before it is sent. A later
+/// submission that samples the texture checks it again while it is
+/// prepared and, if the title changed the texture's memory, detiled it into
+/// the same buffer at once, while the copy of the earlier submission could
+/// still be waiting on the card (flights in the air, the relay). That copy
+/// then read bytes of two versions of the texture. With the guard the check
+/// is put off until the earlier submission has landed: nothing waits, the
+/// change is found again at a later check (the texture's own notes are left
+/// as they were), and the texture shows it that much later. No copy from the
+/// buffer is recorded meanwhile: lists record one only after a detiling.
+fn staging_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_GUARD").is_none_or(|v| v != "0"))
+}
+
+/// Texture refreshes put off by [`staging_guard`] since the last frame line.
+pub(crate) static GUARDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a submission before `preparing` (the one being prepared) whose
+/// lists copy from a staging buffer, the last of them `copied_by`, may still
+/// be on the card: the submissions up to `finished` have landed. Copies of
+/// the submission being prepared run after everything it prepares.
+fn copy_in_flight(copied_by: u64, preparing: u64, finished: u64) -> bool {
+    copied_by > finished && copied_by < preparing
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::copy_in_flight;
+
+    #[test]
+    fn a_staging_buffer_is_left_alone_while_an_earlier_copy_from_it_may_be_on_the_card() {
+        // Submission 7 copies from it and has not landed (5 has): the
+        // check of submission 9 leaves it alone.
+        assert!(copy_in_flight(7, 9, 5));
+        assert!(copy_in_flight(7, 8, 6));
+        // Submission 7 has landed, or nothing ever copied from it.
+        assert!(!copy_in_flight(7, 9, 7));
+        assert!(!copy_in_flight(7, 9, 8));
+        assert!(!copy_in_flight(0, 9, 0));
+        // The submission being prepared copies from it itself: its copies
+        // run after everything it prepares, so it may write the buffer.
+        assert!(!copy_in_flight(9, 9, 5));
+    }
+}
+
 /// (Neptune) The upload buffers of staging buffers that are gone, by size class, and their
 /// bytes: every texture streamed in made an upload buffer of its own and let it go with its
 /// staging buffer (123,000 of them, 7.3 GB, in the first four minutes of a run), each a
@@ -728,7 +785,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-        list.defer_texture(staging);
+        list.defer_texture(staging, false);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -803,10 +860,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     let Some(on_demand) = on_demand else {
         // Once per submission however many of its lists sample the texture.
-        list.defer_texture(staging);
+        list.defer_texture(staging, true);
         return;
     };
-    list.defer_texture(staging.clone());
+    list.defer_texture(staging.clone(), true);
     list.defer_host(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
@@ -1028,14 +1085,32 @@ impl Staging {
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    /// since the last time (and is mapped at all), for submission
+    /// `submission`, which is being prepared. Not while an earlier
+    /// submission that copies from the buffer may still be on the card
+    /// ([`copy_in_flight`]).
+    pub(crate) fn refresh(&self, submission: u64) {
         use std::sync::atomic::Ordering::Relaxed;
+        if staging_guard()
+            && copy_in_flight(
+                self.copied_by.load(std::sync::atomic::Ordering::Acquire),
+                submission,
+                crate::host::finished(),
+            )
+        {
+            GUARDED.fetch_add(1, Relaxed);
+            return;
+        }
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+    }
+
+    /// Notes that a list of `submission` copies from the staging buffer.
+    pub(crate) fn note_copy(&self, submission: u64) {
+        self.copied_by.fetch_max(submission, std::sync::atomic::Ordering::Release);
     }
 
     /// Returns the bytes of title memory read.
@@ -1674,6 +1749,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        copied_by: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
