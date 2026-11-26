@@ -916,6 +916,16 @@ pub(crate) fn evict_kept_resources(
     frame: u64,
     cooldown_frames: u64,
 ) -> (usize, Vec<usize>) {
+    evict_kept_resources_with(victims, frame, cooldown_frames, 0)
+}
+
+#[cfg(windows)]
+pub(crate) fn evict_kept_resources_with(
+    victims: &std::collections::HashSet<usize>,
+    frame: u64,
+    cooldown_frames: u64,
+    min_idle_frames: u64,
+) -> (usize, Vec<usize>) {
     if victims.is_empty() {
         return (0, Vec::new());
     }
@@ -931,10 +941,11 @@ pub(crate) fn evict_kept_resources(
                 continue;
             };
             let mut shader_slots = Vec::new();
-            unmade += host.evict_kept(
+            unmade += host.evict_kept_with(
                 victims,
                 frame,
                 cooldown_frames,
+                min_idle_frames,
                 &mut removed,
                 &mut shader_slots,
             );
@@ -958,18 +969,52 @@ pub(crate) fn evict_kept_resources(
             }
         }
     }
-    if !removed.is_empty() {
-        if crate::host::submissions_in_flight() == 0 {
-            // Synchronous drop outside all locks decrements duplicate heap COM
-            // references immediately (even under `VICTORY_REAPER=1`) while
-            // `Hosted::made` still owns ref #1; Pass 2's `host::retire` then
-            // offloads final D3D12 resource destruction to the reaper.
-            drop(removed);
-        } else {
-            crate::host::retire(removed);
+    host::release_yielded_resources(removed);
+    (unmade, resources)
+}
+
+/// Yields superseded `keep_views` slots across all live shader heaps under
+/// VRAM pressure, releasing displaced older textures outside all locks so their
+/// COM reference counts drop to 1 for immediate LRU eviction.
+#[cfg(windows)]
+pub(crate) fn yield_kept_views() -> usize {
+    if !host::kept_views_yield() {
+        return 0;
+    }
+    let mut removed = Vec::new();
+    let mut unmade = 0usize;
+    {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed under lock in `Drop`).
+            let heap = unsafe { &*(at as *const Heap) };
+            let Some(Some(host)) = heap.host.get() else {
+                continue;
+            };
+            unmade += host.yield_kept_views_into(&mut removed);
         }
     }
-    (unmade, resources)
+    host::release_yielded_resources(removed);
+    unmade
+}
+
+/// Collects per-resource recency across every live shader heap's `kept` slots.
+#[cfg(windows)]
+pub(crate) fn heap_resource_recency(
+    frame: u64,
+    min_idle_frames: u64,
+) -> std::collections::HashMap<usize, host::HeapResourceRecency> {
+    let mut recency = std::collections::HashMap::new();
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed under lock in `Drop`).
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(Some(host)) = heap.host.get() else {
+            continue;
+        };
+        host.collect_resource_recency(frame, min_idle_frames, &mut recency);
+    }
+    recency
 }
 
 fn record(handle: u64, view: View) {
