@@ -40,9 +40,13 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
-    fence: ID3D12Fence,
+    pub(crate) fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Lock-free mirror of the last value signalled on `fence` (updated
+    /// immediately after every `queue.Signal(&self.fence, *submitted)` for
+    /// cross-queue `LazyReadback` synchronization).
+    submitted_fence: std::sync::atomic::AtomicU64,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -759,6 +763,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            submitted_fence: std::sync::atomic::AtomicU64::new(0),
             event,
             rtvs,
             rtv_size,
@@ -3517,6 +3522,12 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             {
                 return true;
             }
+            if let Step::GpuWrite(shadow, address, len) = step
+                && shadow.writes_pending()
+                && shadow.has_lazy_resync_under_writes(*address, *len)
+            {
+                return true;
+            }
             if !indexed
                 && let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
@@ -4173,7 +4184,16 @@ fn relay_hand_back(back: &[Declared]) {
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
-        for (at, n) in found {
+        let deferred = if crate::shadow::lazy_copyback() && !found.is_empty() {
+            let pieces: Vec<(usize, usize)> = found.iter().map(|&(at, n)| (at, at + n)).collect();
+            shadow.try_defer_shadow_pieces(&pieces, None)
+        } else {
+            Vec::new()
+        };
+        for (idx, (at, n)) in found.into_iter().enumerate() {
+            if deferred.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
             written += shadow.relay_merge(at, n, &mut now, &mut title);
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -4181,6 +4201,13 @@ fn relay_hand_back(back: &[Declared]) {
         crate::copystat::compared(*from, to - from, written);
         let _ = (from, to);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn relay_hand_back_for_test(
+    back: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+) {
+    relay_hand_back(back);
 }
 
 /// For the frame-rate line, with [`late`]: what the line of flights did
@@ -5797,6 +5824,44 @@ impl Host {
                 }
             }
         }
+        // Lazy GPU-resident write-back (`VICTORY_LAZY_COPYBACK=1`): defer eligible
+        // full-page pieces before issuing any GPU readback copies.
+        if crate::shadow::lazy_copyback() {
+            if !pieces.is_empty() {
+                let reqs: Vec<(Arc<crate::shadow::Shadow>, usize, usize, Option<u64>)> =
+                    pieces.iter().map(|(s, lo, hi, _)| (s.clone(), *lo, *hi, None)).collect();
+                let deferred = crate::shadow::try_defer_pieces_batch_with_after(&reqs);
+                if deferred.iter().any(|&d| d) {
+                    let mut kept_pieces = Vec::with_capacity(pieces.len());
+                    total = 0;
+                    for (entry, is_def) in pieces.into_iter().zip(deferred) {
+                        if !is_def {
+                            let len = (entry.2 - entry.1) as u64;
+                            kept_pieces.push((entry.0, entry.1, entry.2, total));
+                            total += len;
+                        }
+                    }
+                    pieces = kept_pieces;
+                }
+            }
+            if !kept.is_empty() {
+                let reqs: Vec<(Arc<crate::shadow::Shadow>, usize, usize, Option<u64>)> =
+                    kept.iter().map(|(s, lo, hi, _, _, after)| (s.clone(), *lo, *hi, Some(*after))).collect();
+                let deferred = crate::shadow::try_defer_pieces_batch_with_after(&reqs);
+                if deferred.iter().any(|&d| d) {
+                    let mut remaining = Vec::with_capacity(kept.len());
+                    kept_total = 0;
+                    for (entry, is_def) in kept.into_iter().zip(deferred) {
+                        if !is_def {
+                            let len = (entry.2 - entry.1) as u64;
+                            remaining.push((entry.0, entry.1, entry.2, kept_total, entry.4, entry.5));
+                            kept_total += len;
+                        }
+                    }
+                    kept = remaining;
+                }
+            }
+        }
         // (Neptune) With kept pieces about, the notes of the sends behind
         // the last flight landed stay: the flights in the air merge their
         // kept pieces with their own send numbers (`relay_own_queue`, 4).
@@ -6088,9 +6153,19 @@ impl Host {
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
+        let deferred = if crate::shadow::lazy_copyback() && !pieces.is_empty() {
+            let reqs: Vec<(Arc<crate::shadow::Shadow>, usize, usize, Option<u64>)> =
+                pieces.iter().map(|(s, lo, hi, _, after)| (s.clone(), *lo, *hi, Some(*after))).collect();
+            crate::shadow::try_defer_pieces_batch_with_after(&reqs)
+        } else {
+            Vec::new()
+        };
         let mut title = Vec::new();
         let (mut written, mut bytes) = (0, 0u64);
-        for (shadow, lo, hi, at, after) in &pieces {
+        for (idx, (shadow, lo, hi, at, after)) in pieces.iter().enumerate() {
+            if deferred.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
             // SAFETY: inside the mapping of the slots (checked above); the
             // copy into it ran in the plan's flight, which the card has run.
             let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
@@ -6277,6 +6352,27 @@ impl Host {
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
+        // Lazy GPU-resident write-back (`VICTORY_LAZY_COPYBACK=1`): defer eligible
+        // full-page pieces before issuing `CopyBufferRegion` + CPU wait.
+        if crate::shadow::lazy_copyback() && !pieces.is_empty() {
+            let reqs: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, Option<u64>)> = pieces
+                .iter()
+                .map(|&(i, lo, hi, _)| (plan.ranges[i].shadow.clone(), lo, hi, None))
+                .collect();
+            let deferred = crate::shadow::try_defer_pieces_batch_with_after(&reqs);
+            if deferred.iter().any(|&d| d) {
+                let mut remaining = Vec::with_capacity(pieces.len());
+                total = 0;
+                for (entry, is_def) in pieces.into_iter().zip(deferred) {
+                    if !is_def {
+                        let len = (entry.2 - entry.1) as u64;
+                        remaining.push((entry.0, entry.1, entry.2, total));
+                        total += len;
+                    }
+                }
+                pieces = remaining;
+            }
+        }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
@@ -6302,6 +6398,7 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    self.submitted_fence.store(*submitted, Ordering::Release);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -6895,18 +6992,28 @@ impl Host {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        let back = declared_writes(runs);
         if late {
             *submitted += 1;
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+            let signalled = {
+                let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
+                // SAFETY: closed lists; the fence is ours.
+                let signalled = unsafe {
+                    self.queue.ExecuteCommandLists(&lists);
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                self.card_sent();
+                if signalled.is_ok() {
+                    self.submitted_fence.store(*submitted, Ordering::Release);
+                    for (shadow, _) in &back {
+                        shadow.note_write_fence(*submitted);
+                    }
+                }
+                signalled
             };
-            self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
-            let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -6940,12 +7047,18 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
-                self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let waited = {
+                    let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
+                    self.queue.ExecuteCommandLists(group);
+                    self.card_sent();
+                    self.queue.Signal(&self.fence, *submitted).and_then(|()| {
+                        self.submitted_fence.store(*submitted, Ordering::Release);
+                        for (shadow, _) in &back {
+                            shadow.note_write_fence(*submitted);
+                        }
+                        self.fence.SetEventOnCompletion(*submitted, self.event)
+                    })
+                };
                 match waited {
                     Ok(()) => {
                         working(false);
@@ -7025,7 +7138,6 @@ impl Host {
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
-        let back = declared_writes(runs);
         hand_back(&back);
         if let Some(card) = card {
             self.card_done(card);
@@ -7983,6 +8095,8 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        // Fence/status write targets must never be lazily protected `PAGE_NOACCESS`.
+        crate::shadow::lazy_pin_range(dst as usize, bytes);
         // (Neptune) Title memory or a buffer changes at this place in the list: a table made
         // ready before it is made ready again after it (`crate::draw`).
         self.changes.fetch_add(1, Ordering::Relaxed);
@@ -8488,6 +8602,42 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    if !title_dst {
+        let _lazy_src_hold = crate::shadow::lazy_hold_access(src as usize, len);
+        // SAFETY: `!title_dst` means `dst` is writable host memory of `len` bytes.
+        let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+        let _ = crate::shadow::lazy_read_bypass(src as usize, dst_slice, |addr, out| {
+            let run_src = addr as *const u8;
+            let run_dst = out.as_mut_ptr();
+            let run_len = out.len();
+            if fast_copy(run_src, run_dst, run_len) {
+                return true;
+            }
+            #[cfg(feature = "diagnostics")]
+            let moved = std::time::Instant::now();
+            let whole = read(run_src, run_dst, run_len);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+            if whole {
+                return true;
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+            #[cfg(feature = "diagnostics")]
+            let sparse = std::time::Instant::now();
+            if run_len >= 64 << 10 {
+                read_sparse(run_src, run_dst, run_len);
+            } else {
+                read_pieces(run_src, run_dst, run_len);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+            true
+        });
+        return;
+    }
+    let _lazy_src_hold = crate::shadow::lazy_flush_and_hold(src as usize, len);
+    let _lazy_dst_hold = crate::shadow::lazy_flush_and_hold(dst as usize, len);
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
@@ -8608,16 +8758,16 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    // (Neptune) The plain copy first (`fast_copy`); the kernel's where a page is missing.
-    // Below `FAST_LEAST` bytes it is a readability probe (`texture::readable`): the kernel's
-    // read answers it without a fault, and a probe may land on a guard page.
-    if dst.len() >= FAST_LEAST && fast_copy(src, dst.as_mut_ptr(), dst.len()) {
-        return true;
-    }
-    let ok = read(src, dst.as_mut_ptr(), dst.len());
-    // The kernel's read may itself have spent the guard of a page the plain copy met.
-    rearm_guard(FAST_GUARDED.with(|page| page.replace(0)));
-    ok
+    let _lazy_hold = crate::shadow::lazy_hold_access(src as usize, dst.len());
+    crate::shadow::lazy_read_bypass(src as usize, dst, |addr, out| {
+        let run_src = addr as *const u8;
+        if out.len() >= FAST_LEAST && fast_copy(run_src, out.as_mut_ptr(), out.len()) {
+            return true;
+        }
+        let ok = read(run_src, out.as_mut_ptr(), out.len());
+        rearm_guard(FAST_GUARDED.with(|page| page.replace(0)));
+        ok
+    })
 }
 
 /// (Neptune) The fewest bytes the plain copy is used for (fxceless/victory-fork 0b0074e).
@@ -8785,6 +8935,10 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if len == 0 {
+        return;
+    }
+    let _lazy_hold = crate::shadow::lazy_flush_and_hold(dst as usize, len);
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -8801,7 +8955,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    if write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
@@ -8831,6 +8985,50 @@ impl Host {
     /// given memory ahead of the list that uploads them).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
         &self.queue
+    }
+
+    /// Lock-free mirror of the latest value signalled on `self.fence`.
+    pub(crate) fn submitted_fence(&self) -> u64 {
+        self.submitted_fence.load(Ordering::Acquire)
+    }
+
+    /// Test helper: submits `list` asynchronously on `self.queue`, signals
+    /// `self.fence`, updates `self.submitted_fence`, and returns the fence value
+    /// without waiting on the CPU.
+    #[cfg(test)]
+    pub(crate) fn execute_async_for_test(
+        &self,
+        list: &HostList,
+        shadow: &crate::shadow::Shadow,
+    ) -> u64 {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        *submitted += 1;
+        let val = *submitted;
+        let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
+        // SAFETY: closed test command list; `self.queue` and `self.fence` are live.
+        unsafe {
+            let cl: ID3D12CommandList = list.list.cast().expect("cast command list");
+            self.queue.ExecuteCommandLists(&[Some(cl)]);
+            self.queue.Signal(&self.fence, val).expect("signal fence");
+        }
+        self.submitted_fence.store(val, Ordering::Release);
+        shadow.note_write_fence(val);
+        val
+    }
+
+    /// Test helper: waits until `self.fence` reaches `target`.
+    #[cfg(test)]
+    pub(crate) fn wait_fence_for_test(&self, target: u64) {
+        let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: live fence and event under `self.submitted`.
+        unsafe {
+            if self.fence.GetCompletedValue() < target {
+                self.fence
+                    .SetEventOnCompletion(target, self.event)
+                    .expect("set fence event");
+                WaitForSingleObject(self.event, INFINITE);
+            }
+        }
     }
 
     /// A buffer in the upload heap, mapped for writing.
@@ -9287,6 +9485,8 @@ impl Meter {
         // `VICTORY_FRAMETIME_DUMP`: one row per summary interval, with the
         // buckets above and the worst/mean frame measured at each present.
         let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
+        let lazy = crate::shadow::take_lazy_interval(frames);
+        crate::shadow::lazy_line(frames, &lazy);
         crate::frametime::record(&crate::frametime::Row {
             frame: crate::queue::frame_count(),
             frames,
@@ -9324,6 +9524,12 @@ impl Meter {
             depth_planes: planes,
             ram_mb: self.ram_mb,
             cpu_pct: self.cpu_pct,
+            lazy_deferred_pages: lazy.deferred_pages,
+            lazy_veh_faults: lazy.veh_faults,
+            lazy_self_bypass_hits: lazy.self_bypass_hits,
+            lazy_bytes_readback: lazy.bytes_readback,
+            lazy_materialize_ms: lazy.materialize_ms,
+            lazy_protect_ms: lazy.protect_ms,
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();

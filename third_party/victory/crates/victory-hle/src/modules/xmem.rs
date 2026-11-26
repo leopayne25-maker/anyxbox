@@ -613,6 +613,28 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     runs(pages, offset, len).is_some()
 }
 
+/// Flushes and holds any lazy GPU-resident pages currently mapped to `n`
+/// physical pages from `slice` on BEFORE writing through an alias view,
+/// strictly outside the `physical()` lock: preserves partial-page GPU
+/// complements and blocks concurrent relay re-arming across both the physical
+/// write and the subsequent `written()` notification.
+fn flush_and_hold_shown(slice: &Slice, n: usize) -> Vec<victory_gpu::LazyAccessHold> {
+    let mut shown: Vec<usize> = {
+        let physical = physical();
+        (0..n)
+            .filter_map(|k| physical.shown.get(&slice.key(k)))
+            .flatten()
+            .copied()
+            .collect()
+    };
+    shown.sort_unstable();
+    shown.dedup();
+    shown
+        .chunk_by(|a, b| a + PAGE == *b)
+        .map(|run| victory_gpu::kernel_will_write_hold(run[0], run.len() * PAGE))
+        .collect()
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -624,6 +646,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
+        let _holds = flush_and_hold_shown(slice, *n);
         let Some(mut view) = View::map(slice, *n) else {
             return false;
         };
@@ -664,6 +687,7 @@ pub(crate) struct PageWindow {
     within: usize,
     len: usize,
     slice: Slice,
+    _holds: Vec<victory_gpu::LazyAccessHold>,
 }
 
 impl Drop for PageWindow {
@@ -689,11 +713,13 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let holds = flush_and_hold_shown(slice, *n);
     Some(PageWindow {
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
         slice: slice.clone(),
+        _holds: holds,
     })
 }
 
