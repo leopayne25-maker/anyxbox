@@ -8,6 +8,9 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+#[cfg(test)]
+mod table_cache_tests;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -472,7 +475,7 @@ pub(crate) struct State {
     host_heaps_set: bool,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    fresh_tables: std::collections::HashMap<(usize, u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -3900,7 +3903,7 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
+            // The heap, table address and the record words it holds.
             let key = {
                 let mut h = RecordHash::default();
                 for k in 0..n {
@@ -3908,10 +3911,15 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
-                (table, n, h.0)
+                (std::ptr::from_ref(heap) as usize, table, n, h.0)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
-            let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            let reader = (
+                std::ptr::from_ref(plan) as usize,
+                group.slot,
+                STORES.get(),
+                TESTED_DEPTH.get().0,
+            );
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
@@ -4787,11 +4795,11 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
 struct FreshTable {
     first: u32,
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that
-    /// these readers (a stage's list of what it reads, whether it stores, the
+    /// these readers (stage plan, root slot, whether it stores, the
     /// tested depth target) read were brought up to date, and whether that read the
     /// tested depth target.
     epoch: u64,
-    ready: Vec<((usize, usize, bool, usize), bool)>,
+    ready: Vec<((usize, u8, bool, usize), bool)>,
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
