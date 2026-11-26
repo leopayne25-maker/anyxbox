@@ -8142,9 +8142,10 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
-    /// Runs the list's submission-time steps; refreshes go into `batch`
-    /// (the title's big buffers, a 174 MB one among them, are read by most
-    /// lists of a submission, through many ranges).
+    /// Runs the list's submission-time steps; refreshes and the ranges given
+    /// to shaders go into `batch` (the title's big buffers, a 174 MB one
+    /// among them, are read by most lists of a submission, through many
+    /// ranges).
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
@@ -8200,19 +8201,11 @@ impl HostList {
                 }
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data: this copy's
-                    // pending refresh first. The other copies' wait for
-                    // the next flush of all (flushing all of them at every
-                    // range a dispatch writes made thousands of write-watch
-                    // askings a frame).
-                    batch.flush_one(shadow);
+                    // pending refreshes first, then its bytes are kept, both
+                    // at the next flush, in this order (`Batch::add_gpu_write`).
                     #[cfg(feature = "diagnostics")]
-                    let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
-                    }
+                    add(C::GpuWrites, 1);
+                    batch.add_gpu_write(shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -8297,14 +8290,150 @@ mod parallel_refresh_tests {
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
+///
+/// A copy's piece of work is all its steps of the flush in their order
+/// ([`ShadowBatch`]): its refreshes and the ranges given to its shaders,
+/// whose bytes are kept just after the refresh before them. (The refreshes
+/// before a range given to shaders were done one at a time on the
+/// submitting thread as each range was given, outside the flush's one
+/// write-watch asking.)
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// One thing a flush of a [`Batch`] does to a host copy, in the order of
+/// the submission's steps for that copy.
+#[derive(Debug, PartialEq, Eq)]
+enum ShadowStep {
+    /// `[from, to)` brought up to date ([`crate::shadow::Shadow::update`]):
+    /// refreshes with nothing between them, as the range that covers them.
+    Refresh(usize, usize),
+    /// A range given to shaders again in the submission: nothing to do, but
+    /// the refreshes before it are not merged with those after it (each
+    /// declaration brought the copy's pending refresh up to date).
+    Barrier,
+    /// `(address, len)` given to shaders ([`crate::shadow::Shadow::writing`]),
+    /// the first time in the submission: its bytes are kept after the
+    /// refreshes before it and before those after it.
+    Write(usize, usize),
+}
+
+/// What a flush does to one host copy: its steps, in order, done on one
+/// thread, and the range that covers its refreshes (for the flush's one
+/// write-watch asking).
+struct ShadowBatch<C> {
+    shadow: C,
+    refresh_span: Option<(usize, usize)>,
+    steps: Vec<ShadowStep>,
+}
+
+impl ShadowBatch<std::sync::Arc<crate::shadow::Shadow>> {
+    /// The copy's steps, one after the other.
+    fn run(self) {
+        for step in self.steps {
+            match step {
+                ShadowStep::Refresh(from, to) => Batch::update(&self.shadow, from, to),
+                ShadowStep::Barrier => {}
+                ShadowStep::Write(address, len) => {
+                    #[cfg(feature = "diagnostics")]
+                    let snapshot = std::time::Instant::now();
+                    self.shadow.writing(address, len);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                }
+            }
+        }
+    }
+}
+
+/// A refresh of `[address, end)` among a copy's steps: into the refresh
+/// just before it if no other step came between, else a step of its own;
+/// and into `span`, the range that covers all the copy's refreshes.
+fn push_refresh_step(span: &mut Option<(usize, usize)>, steps: &mut Vec<ShadowStep>, address: usize, end: usize) {
+    *span = Some(match *span {
+        Some((from, to)) => (from.min(address), to.max(end)),
+        None => (address, end),
+    });
+    match steps.last_mut() {
+        Some(ShadowStep::Refresh(from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
+        _ => steps.push(ShadowStep::Refresh(address, end)),
+    }
+}
+
+/// A submission's work on host copies not done yet, per copy (`C`, known
+/// by `key`, its address), and the ranges its shaders were given so far
+/// ([`Batch`]).
+struct CopyOps<C> {
+    /// The copies named since the last flush, in the order first named.
+    copies: Vec<ShadowBatch<C>>,
+    /// Where each copy is in `copies`: the list that makes the heap's
+    /// buffers ready adds some 4,100 copies, and searching them for every
+    /// refresh of a submission was tens of millions of comparisons a frame.
+    index: std::collections::HashMap<usize, usize>,
+    /// The ranges given to shaders in the submission so far, as (copy's
+    /// key, from, to): a range given again keeps no bytes. Kept across
+    /// flushes.
+    declared: std::collections::HashSet<(usize, usize, usize)>,
+}
+
+impl<C> Default for CopyOps<C> {
+    fn default() -> Self {
+        CopyOps {
+            copies: Vec::new(),
+            index: std::collections::HashMap::new(),
+            declared: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl<C: Clone> CopyOps<C> {
+    /// The copy's entry in `copies`, made if it has none.
+    fn entry(&mut self, key: usize, copy: &C) -> &mut ShadowBatch<C> {
+        let at = *self.index.entry(key).or_insert_with(|| {
+            self.copies.push(ShadowBatch {
+                shadow: copy.clone(),
+                refresh_span: None,
+                steps: Vec::new(),
+            });
+            self.copies.len() - 1
+        });
+        &mut self.copies[at]
+    }
+
+    /// `[address, end)` of the copy is brought up to date at the flush.
+    fn refresh(&mut self, key: usize, copy: &C, address: usize, end: usize) {
+        let entry = self.entry(key, copy);
+        push_refresh_step(&mut entry.refresh_span, &mut entry.steps, address, end);
+    }
+
+    /// Shaders may write `len` bytes at `address` of the copy: the first
+    /// time in the submission it is declared, and its bytes are kept at the
+    /// flush after the refreshes before it. Declared again it only keeps
+    /// those refreshes from merging with later ones ([`ShadowStep::Barrier`]):
+    /// `Shadow::writing` did nothing more for it (it is counted once per
+    /// submission and is pending already).
+    fn gpu_write(&mut self, key: usize, copy: &C, address: usize, len: usize) {
+        if self.declared.insert((key, address, address + len)) {
+            self.entry(key, copy).steps.push(ShadowStep::Write(address, len));
+        } else if let Some(&at) = self.index.get(&key)
+            && matches!(self.copies[at].steps.last(), Some(ShadowStep::Refresh(..)))
+        {
+            self.copies[at].steps.push(ShadowStep::Barrier);
+        }
+    }
+
+    /// The copies' work, taken for a flush.
+    fn take(&mut self) -> Vec<ShadowBatch<C>> {
+        self.index.clear();
+        std::mem::take(&mut self.copies)
+    }
+}
+
+/// A submission's work on host copies not done yet: done before a step
+/// that writes title memory, and before the lists run. Per copy its
+/// refreshes, merged into the range that covers them where nothing comes
+/// between, and the ranges given to its shaders, in order ([`CopyOps`]).
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -8312,12 +8441,7 @@ fn wide_refresh() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Where each copy (by address) is in `refreshes`: the list that makes
-    /// the heap's buffers ready adds some 4,100 copies, and searching them
-    /// for every refresh of a submission was tens of millions of
-    /// comparisons a frame.
-    index: std::collections::HashMap<usize, usize>,
+    ops: CopyOps<std::sync::Arc<crate::shadow::Shadow>>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
     /// With [`parallel_refresh`]: textures due a check, not checked yet
@@ -8327,32 +8451,16 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
-            }
-            None => {
-                self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
-            }
-        }
+        self.ops.refresh(std::sync::Arc::as_ptr(shadow) as usize, shadow, address, address + len);
     }
 
-    /// Before shaders are given a range of `shadow`'s copy: its pending
-    /// refresh is done, the others stay pending.
-    fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
-        let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
-            return;
-        };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
-        // The last entry took its place.
-        if let Some(moved) = self.refreshes.get(at) {
-            self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
-        }
-        Self::update(&shadow, from, to);
+    /// Shaders are given `len` bytes at `address` of `shadow`'s copy: they
+    /// start from the title's data, so the copy's refreshes noted before it
+    /// are done first, at the flush, and its bytes are kept then. (Flushing
+    /// all copies at every range a dispatch writes made thousands of
+    /// write-watch askings a frame.)
+    fn add_gpu_write(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        self.ops.gpu_write(std::sync::Arc::as_ptr(shadow) as usize, shadow, address, len);
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -8425,38 +8533,37 @@ impl Batch {
 
     fn flush(&mut self) {
         self.check_textures();
-        self.index.clear();
+        let copies = self.ops.take();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = copies.iter().filter(|c| c.refresh_span.is_some()).count() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
+            let ranges: Vec<(usize, usize)> = copies
                 .iter()
-                .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .filter(|c| !c.shadow.unwatched())
+                .filter_map(|c| c.refresh_span)
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
-            // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
+        if wide_refresh() && copies.len() >= 4 {
+            // Each copy on its own, several at a time: a copy's steps write
+            // that copy and read title memory, nothing of another's, and
+            // one thread does all of a copy's steps, in order. The time
+            // counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = copies
+                .into_iter()
+                .map(|copy| Box::new(move || copy.run()) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for copy in copies {
+                copy.run();
             }
         }
         if ahead {
@@ -10369,6 +10476,125 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    /// Refreshes with nothing between them are one, the range that covers
+    /// them; a step between them (a range given to shaders, or given
+    /// again) ends it. The span covers them all, for the flush's asking.
+    #[test]
+    fn refreshes_merge_up_to_the_next_step_between_them() {
+        use super::{ShadowStep, push_refresh_step};
+        let (mut span, mut steps) = (None, Vec::new());
+        push_refresh_step(&mut span, &mut steps, 100, 200);
+        push_refresh_step(&mut span, &mut steps, 50, 120);
+        push_refresh_step(&mut span, &mut steps, 180, 260);
+        assert_eq!(steps, [ShadowStep::Refresh(50, 260)]);
+        steps.push(ShadowStep::Barrier);
+        push_refresh_step(&mut span, &mut steps, 300, 400);
+        steps.push(ShadowStep::Write(320, 8));
+        push_refresh_step(&mut span, &mut steps, 10, 20);
+        push_refresh_step(&mut span, &mut steps, 30, 40);
+        assert_eq!(
+            steps,
+            [
+                ShadowStep::Refresh(50, 260),
+                ShadowStep::Barrier,
+                ShadowStep::Refresh(300, 400),
+                ShadowStep::Write(320, 8),
+                ShadowStep::Refresh(10, 40),
+            ]
+        );
+        assert_eq!(span, Some((10, 400)));
+    }
+
+    /// Per copy, the steps of a flush are those of the submission in its
+    /// order, as when each range given to shaders first brought that
+    /// copy's refreshes up to date: refresh, then the range's bytes kept,
+    /// then the later refreshes. A copy is one piece of work, wherever its
+    /// steps lie among another's.
+    #[test]
+    fn a_copys_refreshes_and_shader_writes_keep_their_order() {
+        use super::{CopyOps, ShadowStep};
+        let mut ops: CopyOps<&str> = CopyOps::default();
+        ops.refresh(1, &"a", 100, 200);
+        ops.refresh(2, &"b", 0, 10);
+        ops.gpu_write(1, &"a", 150, 20);
+        ops.refresh(1, &"a", 300, 400);
+        ops.refresh(2, &"b", 5, 30);
+        ops.refresh(1, &"a", 50, 60);
+        ops.gpu_write(2, &"b", 8, 4);
+        // Given again: nothing to do, but the refreshes before it are not
+        // merged with those after it; right after a shader write, nothing.
+        ops.gpu_write(1, &"a", 150, 20);
+        ops.refresh(1, &"a", 500, 600);
+        ops.gpu_write(2, &"b", 8, 4);
+        ops.refresh(2, &"b", 40, 50);
+        // Shader writes only.
+        ops.gpu_write(3, &"c", 0, 64);
+        let copies = ops.take();
+        let got: Vec<_> = copies.iter().map(|c| (c.shadow, c.refresh_span, c.steps.as_slice())).collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "a",
+                    Some((50, 600)),
+                    &[
+                        ShadowStep::Refresh(100, 200),
+                        ShadowStep::Write(150, 20),
+                        ShadowStep::Refresh(50, 400),
+                        ShadowStep::Barrier,
+                        ShadowStep::Refresh(500, 600),
+                    ][..]
+                ),
+                ("b", Some((0, 50)), &[ShadowStep::Refresh(0, 30), ShadowStep::Write(8, 4), ShadowStep::Refresh(40, 50)][..]),
+                ("c", None, &[ShadowStep::Write(0, 64)][..]),
+            ]
+        );
+        // After the flush: a range given again has nothing to do; a new
+        // refresh is a new piece of work.
+        ops.gpu_write(1, &"a", 150, 20);
+        assert!(ops.take().is_empty());
+        ops.refresh(1, &"a", 0, 8);
+        ops.gpu_write(1, &"a", 150, 20);
+        ops.refresh(1, &"a", 16, 24);
+        let copies = ops.take();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].steps, [ShadowStep::Refresh(0, 8), ShadowStep::Barrier, ShadowStep::Refresh(16, 24)]);
+    }
+
+    /// A range given to shaders keeps its bytes the first time in the
+    /// submission only, across its flushes: each (copy, range) is one
+    /// [`ShadowStep::Write`], at the flush where it was first given, as
+    /// `Shadow::writing` once per submission did at each step.
+    #[test]
+    fn a_range_given_again_keeps_no_bytes_across_flushes() {
+        use super::{CopyOps, ShadowStep};
+        // (copy, address, len), across two flushes; copy 7 twice per flush.
+        let declarations: [(usize, usize, usize); 10] =
+            [(7, 64, 32), (3, 0, 16), (7, 64, 32), (7, 0, 8), (3, 0, 16), (9, 4, 4), (3, 32, 16), (7, 64, 16), (9, 4, 4), (7, 0, 8)];
+        let mut ops: CopyOps<usize> = CopyOps::default();
+        let mut writes: Vec<(usize, usize, usize)> = Vec::new();
+        for (i, &(copy, address, len)) in declarations.iter().enumerate() {
+            ops.gpu_write(copy, &copy, address, len);
+            if i == 4 || i == declarations.len() - 1 {
+                for c in ops.take() {
+                    for step in &c.steps {
+                        match *step {
+                            ShadowStep::Write(address, len) => writes.push((c.shadow, address, len)),
+                            ref other => panic!("only writes were given, not {other:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        // Per flush, by copy in the order first named, each range once.
+        assert_eq!(writes, [(7, 64, 32), (7, 0, 8), (3, 0, 16), (9, 4, 4), (3, 32, 16), (7, 64, 16)]);
+        let mut firsts: Vec<_> = declarations.to_vec();
+        firsts.sort_unstable();
+        firsts.dedup();
+        writes.sort_unstable();
+        assert_eq!(writes, firsts);
     }
 
     /// The hashing a submission does for textures in physical-page memory,
