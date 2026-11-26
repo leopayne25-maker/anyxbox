@@ -336,7 +336,7 @@ impl App {
             }
         }
         let steps: Result<Vec<Step>, anyxboxx::run::RunError> = if precompile_only {
-            launch::precompile_steps(&plan)
+            launch::precompile_steps(&plan, self.settings.options.warm_first)
         } else {
             launch::play_steps(&plan, self.settings.options.warm_first)
         };
