@@ -548,7 +548,9 @@ pub(crate) type Uploads = (Arc<Shadow>, Vec<(usize, usize, crate::windowup::Chun
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    ranges.sort_unstable();
+    if !ranges.is_sorted() {
+        ranges.sort_unstable();
+    }
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for (from, to) in ranges {
         match out.last_mut() {
@@ -565,7 +567,9 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
 pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
-    runs.sort_unstable_by_key(|r| r.first);
+    if !runs.is_sorted_by_key(|r| r.first) {
+        runs.sort_unstable_by_key(|r| r.first);
+    }
     let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
@@ -577,6 +581,29 @@ pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
         }
     }
     out
+}
+
+/// Streaming [`joined_piece_runs`] over an iterator of [`CardSpan`]s: when the
+/// input is already ordered by `first` (as `card_dirty`'s sorted ranges are),
+/// adjacent pieces merge in place without allocating an unmerged `Vec<CardSpan>`
+/// of tens of thousands of two-byte runs or sorting them.
+pub(crate) fn joined_piece_runs_iter(runs: impl IntoIterator<Item = CardSpan>) -> Vec<CardSpan> {
+    let mut out: Vec<CardSpan> = Vec::new();
+    let mut unsorted = false;
+    for run in runs {
+        match out.last_mut() {
+            Some(last) if run.first < last.first => {
+                unsorted = true;
+                out.push(run);
+            }
+            Some(last) if run.first <= last.first + last.pieces => {
+                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+                last.to = last.to.max(run.to);
+            }
+            _ => out.push(run),
+        }
+    }
+    if unsorted { joined_piece_runs(out) } else { out }
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
@@ -615,7 +642,7 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs, joined_piece_runs_iter};
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -631,12 +658,19 @@ mod card_tests {
         let mut wanted: Vec<u32> = runs.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
         wanted.sort_unstable();
         wanted.dedup();
+        let from_unsorted_iter = joined_piece_runs_iter(runs.iter().copied());
+        let mut sorted_runs = runs.clone();
+        sorted_runs.sort_unstable_by_key(|r| r.first);
+        let from_sorted_iter = joined_piece_runs_iter(sorted_runs);
         let joined = joined_piece_runs(runs);
+        assert_eq!(from_unsorted_iter, joined);
+        assert_eq!(from_sorted_iter, joined);
         let got: Vec<u32> = joined.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
         assert_eq!(got, wanted);
         assert_eq!(joined.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
         assert!(joined.iter().all(|r| r.skew == 7));
         assert!(joined_piece_runs(Vec::new()).is_empty());
+        assert!(joined_piece_runs_iter(std::iter::empty()).is_empty());
     }
 
     /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`

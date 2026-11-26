@@ -2088,15 +2088,24 @@ static CARD_MASKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// (Neptune) The passes those blocks went up in.
 static CARD_MASKED_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Split of a copy's dirty ranges into direct `CopyBufferRegion` spans and
+/// 4 KiB masked blocks (`blocks` indexes into the flat `ranges` slice so
+/// splitting tens of thousands of runs allocates no per-block `Vec`s).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MaskedSplit {
+    copies: Vec<(usize, usize)>,
+    blocks: Vec<(usize, std::ops::Range<usize>)>,
+    ranges: Vec<(usize, usize)>,
+}
+
 /// (Neptune) Of `ranges` of a copy (offsets; in order, none touching
 /// another): those to send up as copies, and the 4 KiB blocks to send up
-/// by mask ([`under_writes_masks`]), each with its ranges, in order. A
-/// block is sent by mask if `least` ranges or more lie in it; a range that
+/// by mask ([`under_writes_masks`]), each with its slice of ranges, in order.
+/// A block is sent by mask if `least` ranges or more lie in it; a range that
 /// lies in two blocks is a copy.
-fn masked_blocks(ranges: &[(usize, usize)], least: usize) -> (Vec<(usize, usize)>, Vec<(usize, Vec<(usize, usize)>)>) {
+fn masked_blocks(ranges: &[(usize, usize)], least: usize) -> MaskedSplit {
     const BLOCK: usize = 4096;
-    let mut copies = Vec::new();
-    let mut blocks: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+    let mut out = MaskedSplit::default();
     if least <= 1 {
         // Every short range, cut at the blocks' ends; the ranges are in order.
         for &(a, b) in ranges {
@@ -2104,53 +2113,80 @@ fn masked_blocks(ranges: &[(usize, usize)], least: usize) -> (Vec<(usize, usize)
                 continue;
             }
             if b - a >= 2 * BLOCK {
-                copies.push((a, b));
+                out.copies.push((a, b));
                 continue;
             }
             let mut at = a;
             while at < b {
                 let block = at / BLOCK;
                 let end = ((block + 1) * BLOCK).min(b);
-                match blocks.last_mut() {
-                    Some(last) if last.0 == block => last.1.push((at, end)),
-                    _ => blocks.push((block, vec![(at, end)])),
+                let idx = out.ranges.len();
+                out.ranges.push((at, end));
+                match out.blocks.last_mut() {
+                    Some(last) if last.0 == block => last.1.end = idx + 1,
+                    _ => out.blocks.push((block, idx..idx + 1)),
                 }
                 at = end;
             }
         }
-        return (copies, blocks);
+        return out;
     }
     let mut i = 0;
     while i < ranges.len() {
         let (a, b) = ranges[i];
         let block = a / BLOCK;
         if b <= a || (b - 1) / BLOCK != block {
-            copies.push((a, b));
+            out.copies.push((a, b));
             i += 1;
             continue;
         }
         let mut j = i + 1;
-        while j < ranges.len() && ranges[j].0 / BLOCK == block && ranges[j].1 > ranges[j].0 && (ranges[j].1 - 1) / BLOCK == block {
+        while j < ranges.len()
+            && ranges[j].0 / BLOCK == block
+            && ranges[j].1 > ranges[j].0
+            && (ranges[j].1 - 1) / BLOCK == block
+        {
             j += 1;
         }
         if j - i >= least {
-            blocks.push((block, ranges[i..j].to_vec()));
+            let start = out.ranges.len();
+            out.ranges.extend_from_slice(&ranges[i..j]);
+            out.blocks.push((block, start..out.ranges.len()));
         } else {
-            copies.extend_from_slice(&ranges[i..j]);
+            out.copies.extend_from_slice(&ranges[i..j]);
         }
         i = j;
     }
-    (copies, blocks)
+    out
 }
 
 /// (Neptune) The mask of a block for [`CARD_PATCH`]: a bit for each byte
-/// of `ranges` (offsets of the copy, all in block `block`).
+/// of `ranges` (offsets of the copy, all in block `block`), packed 64 bits
+/// at a time.
 pub(crate) fn block_mask(block: usize, ranges: &[(usize, usize)]) -> [u8; 512] {
-    let mut mask = [0u8; 512];
+    let base = block * 4096;
+    let mut words = [0u64; 64];
     for &(a, b) in ranges {
-        for at in a - block * 4096..b - block * 4096 {
-            mask[at / 8] |= 1 << (at % 8);
+        let lo = a.saturating_sub(base).min(4096);
+        let hi = b.saturating_sub(base).min(4096);
+        if lo >= hi {
+            continue;
         }
+        let (w0, s0) = (lo / 64, lo % 64);
+        let (w1, e1) = ((hi - 1) / 64, (hi - 1) % 64);
+        let head = !0u64 << s0;
+        let tail = !0u64 >> (63 - e1);
+        if w0 == w1 {
+            words[w0] |= head & tail;
+        } else {
+            words[w0] |= head;
+            words[w0 + 1..w1].fill(!0u64);
+            words[w1] |= tail;
+        }
+    }
+    let mut mask = [0u8; 512];
+    for (dst, &w) in mask.chunks_exact_mut(8).zip(&words) {
+        dst.copy_from_slice(&w.to_le_bytes());
     }
     mask
 }
@@ -2159,24 +2195,62 @@ pub(crate) fn block_mask(block: usize, ranges: &[(usize, usize)]) -> [u8; 512] {
 mod mask_tests {
     use super::{block_mask, masked_blocks};
 
+    fn block_mask_scalar(block: usize, ranges: &[(usize, usize)]) -> [u8; 512] {
+        let mut mask = [0u8; 512];
+        for &(a, b) in ranges {
+            for at in a - block * 4096..b - block * 4096 {
+                mask[at / 8] |= 1 << (at % 8);
+            }
+        }
+        mask
+    }
+
     /// Every range is a copy or in a block's mask, once; a block has a
     /// mask only with enough ranges; a range in two blocks is a copy.
     #[test]
     fn crowded_blocks_go_up_by_mask_and_the_rest_as_copies() {
         let ranges = [(8, 12), (100, 104), (4090, 4100), (4200, 4204), (8192, 8196), (8200, 8204), (8300, 8301), (12288, 20000)];
-        let (copies, blocks) = masked_blocks(&ranges, 3);
-        assert_eq!(copies, [(8, 12), (100, 104), (4090, 4100), (4200, 4204), (12288, 20000)]);
-        assert_eq!(blocks, [(2, vec![(8192, 8196), (8200, 8204), (8300, 8301)])]);
-        let (copies, blocks) = masked_blocks(&ranges, 2);
-        assert_eq!(copies, [(4090, 4100), (4200, 4204), (12288, 20000)]);
-        assert_eq!(blocks.iter().map(|b| b.0).collect::<Vec<_>>(), [0, 2]);
-        assert!(masked_blocks(&[], 2).1.is_empty());
+        let split = masked_blocks(&ranges, 3);
+        assert_eq!(split.copies, [(8, 12), (100, 104), (4090, 4100), (4200, 4204), (12288, 20000)]);
+        assert_eq!(split.blocks.len(), 1);
+        assert_eq!(split.blocks[0].0, 2);
+        assert_eq!(&split.ranges[split.blocks[0].1.clone()], &[(8192, 8196), (8200, 8204), (8300, 8301)]);
+        let split = masked_blocks(&ranges, 2);
+        assert_eq!(split.copies, [(4090, 4100), (4200, 4204), (12288, 20000)]);
+        assert_eq!(split.blocks.iter().map(|b| b.0).collect::<Vec<_>>(), [0, 2]);
+        assert!(masked_blocks(&[], 2).blocks.is_empty());
+        // Check `least <= 1` splitting across 4 KiB boundaries (and `>= 2 * BLOCK` staying a copy).
+        let ranges1 = [(8, 12), (100, 104), (4090, 4100), (4200, 4204), (8192, 8196), (8200, 8204), (8300, 8301), (24576, 33000)];
+        let split1 = masked_blocks(&ranges1, 1);
+        assert_eq!(split1.copies, [(24576, 33000)]);
+        let gathered: Vec<(usize, Vec<(usize, usize)>)> = split1
+            .blocks
+            .iter()
+            .map(|(blk, span)| (*blk, split1.ranges[span.clone()].to_vec()))
+            .collect();
+        assert_eq!(
+            gathered,
+            vec![
+                (0, vec![(8, 12), (100, 104), (4090, 4096)]),
+                (1, vec![(4096, 4100), (4200, 4204)]),
+                (2, vec![(8192, 8196), (8200, 8204), (8300, 8301)]),
+            ]
+        );
         // The mask: bit i of the block's bytes, low bit first.
         let mask = block_mask(2, &[(8192, 8196), (8200, 8204), (8300, 8301)]);
         assert_eq!(mask[0], 0x0f);
         assert_eq!(mask[1], 0x0f);
         assert_eq!(mask[(8300 - 8192) / 8], 1 << ((8300 - 8192) % 8));
         assert_eq!(mask.iter().map(|m| m.count_ones()).sum::<u32>(), 9);
+        // Word-packed `block_mask` matches scalar reference across edge cases.
+        for sample in [
+            &[(4096, 4097)][..],
+            &[(4096 + 63, 4096 + 65)],
+            &[(4096 + 7, 4096 + 200), (4096 + 511, 4096 + 1025), (4096 + 4095, 4096 + 4096)],
+            &[(4096, 8192)],
+        ] {
+            assert_eq!(block_mask(1, sample), block_mask_scalar(1, sample));
+        }
     }
 }
 
@@ -5216,8 +5290,9 @@ impl Host {
             type Sends = (Vec<(usize, usize)>, Vec<(usize, usize, usize)>);
             let mut sends: Vec<Sends> = dirty.iter().map(|(_, ranges)| (ranges.clone(), Vec::new())).collect();
             if let Some(patch) = work.patch.as_ref() {
-                let split: Vec<_> = dirty.iter().map(|(_, ranges)| masked_blocks(ranges, masks_least())).collect();
-                let blocks: usize = split.iter().map(|s| s.1.len()).sum();
+                let least = masks_least();
+                let split: Vec<MaskedSplit> = dirty.iter().map(|(_, ranges)| masked_blocks(ranges, least)).collect();
+                let blocks: usize = split.iter().map(|s| s.blocks.len()).sum();
                 if blocks > 0 {
                     // A mask and a table entry for each block.
                     let need = (blocks as u64 * (512 + 8)).next_multiple_of(64 << 10);
@@ -5230,13 +5305,14 @@ impl Host {
                     };
                     if let Some((buffer, data, bytes)) = have {
                         let mut at = 0usize;
-                        for (send, (copies, masked)) in sends.iter_mut().zip(split) {
+                        for (send, part) in sends.iter_mut().zip(split) {
                             // The masks one after the other, then the copy's
                             // table: of each block where it begins in the copy
                             // and where its mask is. A pass takes up to 4,000
                             // blocks: (its table's place, blocks, 0).
-                            let mut entries: Vec<[u32; 2]> = Vec::with_capacity(masked.len());
-                            for (block, ranges) in &masked {
+                            let mut entries: Vec<[u32; 2]> = Vec::with_capacity(part.blocks.len());
+                            for (block, span) in &part.blocks {
+                                let ranges = &part.ranges[span.clone()];
                                 let mask = block_mask(*block, ranges);
                                 // SAFETY: the mapping holds `bytes`, and
                                 // `blocks` masks and table entries fit in it
@@ -5255,9 +5331,9 @@ impl Host {
                                 runs.push((at, pass.len(), 0));
                                 at += pass.len() * 8;
                             }
-                            CARD_MASKED[0].fetch_add(masked.len() as u64, Ordering::Relaxed);
+                            CARD_MASKED[0].fetch_add(part.blocks.len() as u64, Ordering::Relaxed);
                             CARD_MASKED_PASSES.fetch_add(runs.len() as u64, Ordering::Relaxed);
-                            *send = (copies, runs);
+                            *send = (part.copies, runs);
                         }
                         debug_assert!(at as u64 <= bytes);
                         masks = Some((buffer, data, bytes));
@@ -5284,16 +5360,19 @@ impl Host {
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
                         // The same pieces in fewer passes (`rehash_runs`).
                         // (Neptune) Also with more runs under shader writes
                         // than before (`under_writes_runs`): thousands of
                         // two-byte ranges would each have a pass of their own.
-                        let runs = if rehash_runs() || under_writes_runs() > 512 { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        // They are joined as they come, in order: no list of
+                        // tens of thousands of two-byte runs is made and sorted.
+                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                            vec![shadow.card_run(0, usize::MAX)]
+                        } else if rehash_runs() || under_writes_runs() > 512 {
+                            crate::shadow::joined_piece_runs_iter(ranges.iter().map(|&(a, b)| shadow.card_run(a, b)))
+                        } else {
+                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                        };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
