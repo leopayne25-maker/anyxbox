@@ -708,6 +708,17 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
+        // Fast path for tightly packed linear mips: copy each 2D slice in one call.
+        if linear && row_pitch == bytes && m.pitch as usize * n == bytes {
+            let slice_bytes = bytes * m.height as usize;
+            for z in 0..depth {
+                let (s, _) = self.split(first + z);
+                let tiled_slice = (u64::from(s) * self.slice_size + m.offset) as usize;
+                let linear_slice = z as usize * depth_pitch;
+                copy_run::<DETILE>(src, dst, tiled_slice, linear_slice, slice_bytes);
+            }
+            return Ok(());
+        }
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
         let mut runs = Vec::new();
@@ -751,6 +762,12 @@ impl Layout {
                         }
                         Some(32) if tiled_row.is_multiple_of(32) => {
                             copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
+                        }
+                        Some(64) if tiled_row.is_multiple_of(64) => {
+                            copy_runs::<64, DETILE>(src, dst, body, tiled_row, linear_row)
+                        }
+                        Some(256) if tiled_row.is_multiple_of(256) => {
+                            copy_runs::<256, DETILE>(src, dst, body, tiled_row, linear_row)
                         }
                         _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
                     }
@@ -1509,5 +1526,41 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn packed_linear_and_wide_runs_round_trip() {
+        // Packed linear 2D (row_pitch == m.pitch * element_bytes) and 64/256-byte chunked swizzles.
+        for (w, h, elem, swizzle) in [
+            (64, 32, 4, Swizzle::LINEAR),
+            (128, 64, 16, Swizzle::SW_64KB_S),
+            (128, 64, 16, Swizzle::SW_64KB_D),
+            (64, 64, 16, Swizzle::SW_4KB_S),
+        ] {
+            let l = Layout::new(&desc(w, h, 1, elem, swizzle)).unwrap();
+            let m = &l.mips[0];
+            let row_pitch = m.width as usize * elem as usize;
+            let linear_in: Vec<u8> = (0..row_pitch * m.height as usize)
+                .map(|i| (i.wrapping_mul(37) ^ (i >> 5)) as u8)
+                .collect();
+            let mut tiled = vec![0u8; l.size as usize];
+            l.tile(&mut tiled, 0, 0, &linear_in, row_pitch, linear_in.len())
+                .unwrap();
+            // Verify against per-element Layout::offset.
+            for y in 0..m.height {
+                for x in 0..m.width {
+                    let at = l.offset(0, x, y, 0).unwrap() as usize;
+                    let lin = y as usize * row_pitch + x as usize * elem as usize;
+                    assert_eq!(
+                        &tiled[at..at + elem as usize],
+                        &linear_in[lin..lin + elem as usize]
+                    );
+                }
+            }
+            let mut linear_out = vec![0u8; linear_in.len()];
+            l.detile(&tiled, 0, 0, &mut linear_out, row_pitch, linear_in.len())
+                .unwrap();
+            assert_eq!(linear_out, linear_in);
+        }
     }
 }
