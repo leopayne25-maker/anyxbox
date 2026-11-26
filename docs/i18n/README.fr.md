@@ -51,7 +51,7 @@ Régénérer : `scarlett.py --carte <dossier du paquet> docs/images/carte-avance
 ![Avancement de la traduction pour Xbox Series X](../images/traduction.svg)
 
 - **Instructions CPU : 100 %.** La Series X utilise un AMD Zen 2 en x86-64, le même jeu d'instructions qu'un PC : le code du jeu tourne tel quel.
-- **Instructions GPU : 89 %.** 1 330 des 1 490 encodages RDNA 2 tournent dans l'interpréteur de référence, et le recompilateur RDNA 2 → DXIL dessine déjà un premier shader de sommet et de pixel avec D3D12.
+- **Instructions GPU : 91 %.** 1 364 des 1 490 encodages RDNA 2 tournent dans l'interpréteur de référence, et le recompilateur RDNA 2 → DXIL dessine déjà un premier shader de sommet et de pixel avec D3D12.
 - **Fonctions système : 66 %** des 1 337 fonctions importées par les DLL du paquet de test sont résolues.
 - **Runtime GDK : 210 fonctions sur 396** sont écrites dans AnyXboxX, en Rust et en C++ : la file de tâches, l'utilisateur hors ligne, l'identité de la Series X, les sauvegardes, le paquet, le Store hors ligne et les invitations. Les autres interfaces sont servies par le runtime GDK de Windows s'il est installé.
 
