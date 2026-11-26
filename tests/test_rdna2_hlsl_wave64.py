@@ -11,6 +11,7 @@ import pytest
 
 from emu import rdna2_exec, rdna2_gpu, rdna2_hlsl
 from test_rdna2_exec import V, const, program, sop1, sop2, sopc, sopp, vop1, vop2, vop3, vopc
+from test_rdna2_exec_lanes import LITERAL, swizzle
 from test_rdna2_exec_memory import BUFFER, INPUT, OUTPUT, ds, global_
 from test_rdna2_hlsl import MEMORY_SIZE
 from test_rdna2_sdwa_dpp_exec import DPP8, SDWA, dpp8_word, sdwa_word
@@ -192,6 +193,23 @@ def test_lane_reads_writes_ids_and_bpermute_match():
     assert output(actual, 0) == list(range(LANES))
     values = lane_values(5)
     assert output(actual, 2)[61] == values[50]
+
+
+@gpu
+@pytest.mark.parametrize("offset, flip", [(0x801B, 3), (0x401F, 16)], ids=["reverse-quad", "swap-16"])
+def test_swizzle_in_place_with_inactive_lanes(offset, flip):
+    expected, actual = compare(with_lane_offset(
+        vop2("v_add_nc_u32", 1, const(1), 0),                    # distinguish every source from zero
+        sop1("s_mov_b32", EXEC_LO, LITERAL), 0xFFFF_FFFE,         # lane 0 inactive
+        sop1("s_mov_b32", EXEC_HI, LITERAL), 0x7FFF_FFFF,         # lane 63 inactive
+        *swizzle(offset, vdst=1, data0=1),
+        sop1("s_mov_b64", EXEC_LO, MINUS_ONE),
+        *store_lane(1, 0)))
+    assert actual == expected
+    result = output(actual, 0)
+    assert (result[0], result[63]) == (1, 64)                    # inactive destinations keep their value
+    assert (result[flip], result[63 ^ flip]) == (0, 0)           # inactive sources supply zero
+    assert (result[1], result[33]) == ((1 ^ flip) + 1, (33 ^ flip) + 1)
 
 
 @gpu

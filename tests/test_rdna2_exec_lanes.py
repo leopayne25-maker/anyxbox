@@ -41,8 +41,9 @@ def test_swizzle_inactive_source_gives_zero():
 def test_rotate_fft_and_reserved_offsets_are_named(offset):
     with pytest.raises(rdna2_exec.Untranslated, match="ds_swizzle_b32"):
         rdna2_exec.run(program(*swizzle(offset)))
-    with pytest.raises(rdna2_hlsl.Untranslatable, match="ds_swizzle_b32"):
-        rdna2_hlsl.translate(program(*swizzle(offset)))
+    for wave_size in (32, 64):
+        with pytest.raises(rdna2_hlsl.Untranslatable, match=f"ds_swizzle_b32.*0x{offset:04X}"):
+            rdna2_hlsl.translate(program(*swizzle(offset)), wave_size=wave_size)
 
 
 def test_permute_forwards_and_highest_lane_wins():

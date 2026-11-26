@@ -91,6 +91,10 @@ Laptop GPU, whose `WaveGetLaneCount()` is 32 (threads 32-63 of the group are lan
 WARP (4-lane waves). The remaining 64-bit scalar forms (`saveexec`/`wrexec` variants, `s_not_b64`, `s_nor_b64`,
 `s_bcnt0`, `s_ff0`, `s_cmov_b64`, `s_cmp_eq_u64`) are checked the same way in a wave32 program.
 
+`ds_swizzle_b32` supports QUAD_PERM and BITMASK_PERM within each 32-lane half. An inactive source supplies zero
+and an inactive destination keeps its value. In-place quad reversal and a 16-lane swap matched the interpreter
+byte for byte on an RTX 4060 Laptop GPU, Intel UHD Graphics and WARP.
+
 Delegated unchanged to the wave32 translation, with `LANE_ON` as the activity test: every other lane-wise ALU,
 64-bit and memory instruction (buffer, scalar and image loads included); they do not depend on the wave size.
 

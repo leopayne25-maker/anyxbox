@@ -99,6 +99,11 @@ lignes 0-31 d'un second warp), et avec WARP (waves de 4 lignes). Les autres form
 `saveexec`/`wrexec`, `s_not_b64`, `s_nor_b64`, `s_bcnt0`, `s_ff0`, `s_cmov_b64`, `s_cmp_eq_u64`) sont vérifiées de
 la même façon dans un programme wave32.
 
+`ds_swizzle_b32` prend en charge QUAD_PERM et BITMASK_PERM dans chaque moitié de 32 lignes. Une source inactive
+fournit zéro et une destination inactive conserve sa valeur. L'inversion de chaque groupe de quatre lignes et
+l'échange par blocs de seize, effectués sur place, donnent le même résultat que l'interpréteur à l'octet près
+sur RTX 4060 Laptop GPU, Intel UHD Graphics et WARP.
+
 Délégué sans changement à la traduction wave32, avec `LANE_ON` comme test d'activité : toute autre instruction ALU
 ligne à ligne, 64 bits ou mémoire (chargements buffer, scalaires et image compris) ; elles ne dépendent pas de la
 taille du wave.

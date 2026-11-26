@@ -21,7 +21,7 @@ from emu.rdna2_exec_cmpf16 import COMPAREF16
 from emu.rdna2_exec_memory import ADD_TID, LDS_ADD_TID
 from emu.rdna2_exec_vop3 import Fields, float_inputs
 from emu.rdna2_hlsl_clamp import CARRY, carry_write, refuse_integer_clamp
-from emu.rdna2_hlsl_memory import memory_statements
+from emu.rdna2_hlsl_memory import memory_statements, swizzle_source_hlsl
 from emu.rdna2_hlsl import SCALAR_FAMILIES, _fields, _literal, _words, modified
 from emu.rdna2_hlsl_ops import (BRANCHES, HELPERS as ALU_HELPERS, NULL, Untranslatable, compare_condition,
                                 is_compare, scalar_target, source, source_high)
@@ -213,6 +213,11 @@ def _specific(data, instruction, name):
         return _vop3(name, instruction.opcode, Fields(pair), _literal(data, instruction, 2))
     if family == "DS" and name == "ds_bpermute_b32":
         return _bpermute(pair)
+    if family == "DS" and name == "ds_swizzle_b32":
+        data0, vdst = (pair >> 40) & 0xFF, (pair >> 56) & 0xFF
+        other = f"(lane & 32u) | {swizzle_source_hlsl(pair & 0xFFFF)}"
+        return [f"{{ uint value = ReadLane64(lane, {ACTIVE} ? v[{data0}] : 0u, {other}); "
+                f"if ({ACTIVE}) v[{vdst}] = value; }}"]
     if family == "GLOBAL" and name in ADD_TID or family == "DS" and name in LDS_ADD_TID:
         return memory_statements(family, name, pair, ACTIVE)    # lane = SV_GroupIndex 0-63: the TID in the wave64
     return None

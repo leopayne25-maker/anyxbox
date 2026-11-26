@@ -153,16 +153,16 @@ def _lanes(name, addr, data0, vdst, offset, active):
     elif name == "ds_bpermute_b32":
         value = f"ReadLane(lane, {data}, {target})"
     else:
-        try:
-            rdna2_exec_lanes.swizzle_source(offset, 0)
-        except NotImplementedError as error:
-            raise Untranslatable(f"non traduite en HLSL : {error}") from error
-        value = f"ReadLane(lane, {data}, {_swizzle_source(offset)})"
+        value = f"ReadLane(lane, {data}, {swizzle_source_hlsl(offset)})"
     return [f"{{ uint value = {value}; if ({active}) v[{vdst}] = value; }}"]
 
 
-def _swizzle_source(offset):
+def swizzle_source_hlsl(offset):
     """Expression HLSL de la ligne lue par ds_swizzle_b32 (QUAD_PERM ou BITMASK_PERM)."""
+    try:
+        rdna2_exec_lanes.swizzle_source(offset, 0)
+    except NotImplementedError as error:
+        raise Untranslatable(f"non traduite en HLSL : {error}") from error
     if offset & swz.QUAD_PERM_ENC_MASK == swz.QUAD_PERM_ENC:
         return f"((lane & ~3u) + ((0x{offset & 0xFF:X}u >> ((lane & 3u) * 2u)) & 3u))"
     and_mask, or_mask, xor_mask = (offset >> shift & swz.BITMASK_MASK for shift in (0, 5, 10))
