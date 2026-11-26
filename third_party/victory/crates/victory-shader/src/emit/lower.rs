@@ -25,6 +25,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "round_even.rs"]
+mod round_even;
+
 /// Descriptors whose dwords the code reads as numbers (`descriptor_data`), a child module so it
 /// shares the emitter's state.
 #[path = "descriptor_data.rs"]
@@ -7336,6 +7339,7 @@ impl<'a> Lower<'a> {
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
                     22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
+                    26 => self.rndne_f32(a),
                     _ => self.unary(op, a),
                 };
                 float(self, r)
@@ -8143,6 +8147,7 @@ impl<'a> Lower<'a> {
                         12 | 13 => self.trig_turns(a, op == 12),
                         // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
                         22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
+                        26 => self.rndne_f32(a),
                         _ => self.unary(op, a),
                     }
                 }
@@ -8774,7 +8779,7 @@ impl<'a> Lower<'a> {
                 // byte src1[1:0] of src2.
                 let f = self.fsrc(inst, 0)?;
                 let (b, d) = (s(self, 1)?, s(self, 2)?);
-                let f = self.unary(26, f);
+                let f = self.rndne_f32(f);
                 let (zero, max) = (self.s.m.f32(0), self.s.m.f32(255.0f32.to_bits()));
                 let f = self.binary(35, f, zero);
                 let f = self.binary(36, f, max);
