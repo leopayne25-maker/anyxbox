@@ -5393,6 +5393,10 @@ mod anisotropic_sampler_tests;
 mod typed_uav_tests;
 
 #[cfg(test)]
+#[path = "alpha_view_tests.rs"]
+mod alpha_view_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
