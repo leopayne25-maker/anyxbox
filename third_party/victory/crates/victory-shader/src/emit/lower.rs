@@ -25,6 +25,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "lane_read.rs"]
+mod lane_read;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -1912,15 +1915,44 @@ impl<'a> Lower<'a> {
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         let mut mirror: Option<LaneMirror> = None;
+        let mut first_lane_uniform = None;
         // D3D12 caps thread-group shared memory at 32 KiB (8,192 dwords).
         const MAX_LDS_DWORDS: u32 = 8192;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            let mut wave = if x.native.wave64 { 64 } else { 32 };
+            let group = cs.threads.iter().product::<u32>();
+            // A non-waterfall first-lane read of a varying VGPR may need the other half.
+            let first_lane_source = |i: &Inst| {
+                if i.name() != "v_readfirstlane_b32"
+                    || i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+                {
+                    return None;
+                }
+                match &i.fields {
+                    Fields::Valu(v) => match v.src.first() {
+                        Some(&Operand::Vector { reg, .. }) => i.read(Reg::V(reg)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            let first_lane_crosses = wave == 64
+                && group >= 64
+                && group.is_multiple_of(64)
+                && insts().any(|i| first_lane_source(i).is_some())
+                && {
+                    first_lane_uniform = all_lane_blocks(x.st)
+                        .map(|all| lane_uniform(p, x.st, &all, wave_tid(p, x)));
+                    insts().filter_map(first_lane_source).any(|source| {
+                        !first_lane_uniform.as_ref().is_some_and(|uniform| uniform.contains(&source))
+                    })
+                };
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            console_lanes = first_lane_crosses || insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -1932,8 +1964,6 @@ impl<'a> Lower<'a> {
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
-            let mut wave = if x.native.wave64 { 64 } else { 32 };
-            let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
@@ -1944,7 +1974,7 @@ impl<'a> Lower<'a> {
             // lane-constant masks), nor when LDS may be shared within the console wave without
             // barriers (a group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                let crosses = insts().any(|i| {
+                let crosses = first_lane_crosses || insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
@@ -2263,7 +2293,9 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, wave_tid(p, x)),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => {
+                    first_lane_uniform.unwrap_or_else(|| lane_uniform(p, x.st, all, wave_tid(p, x)))
+                },
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -5664,57 +5696,10 @@ impl<'a> Lower<'a> {
         r.unwrap_or(x)
     }
 
-    /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
-    /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
-    /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
-    ///
-    /// A helper lane of a pixel shader takes its own value: the console's whole-quad mode has
-    /// helper lanes in EXEC, so a waterfall loop serves them too, and the host's wave operations
-    /// leave them out. Once only helper lanes are left in such a loop none of them ever matched:
-    /// they ran to the iteration limit, and left with no sample for their quad's derivatives,
-    /// along every triangle's edges (upstream #908, the fix of #1733 for this tree's form).
-    fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
-        let (first, any) = self.first_live_lane(x, guard);
-        if !self.s.pixel || !super::helper_own() {
-            return (first, any);
-        }
-        let helper = self.helper_lane();
-        let c = self.cur;
-        let yes = self.s.m.bool(true);
-        (self.s.m.select(c, helper, x, first), self.s.m.select(c, helper, yes, any))
-    }
-
     /// Whether this lane of a pixel shader is a helper lane.
     fn helper_lane(&mut self) -> V {
         let i1t = self.s.t.i1;
         self.s.op(self.cur, "isHelperLane.i1", Attr::ReadOnly, i1t, 221, &[])
-    }
-
-    fn first_live_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        self.s.flags |= flags::WAVE_OPS;
-        let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
-        let Some(g) = guard else {
-            return (first, self.s.m.bool(true));
-        };
-        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-        let r = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
-        let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
-        let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
-        // FirstbitLo (dx.op 32): the lowest set bit
-        let flo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
-        let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
-        let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
-        let in_lo = self.s.m.cmp(c, pred::NE, lo, z);
-        let in_hi = self.s.m.cmp(c, pred::NE, hi, z);
-        let any = self.s.m.bin(c, Bin::Or, in_lo, in_hi);
-        let lane = self.s.m.select(c, in_lo, flo, fhi);
-        // no lane in EXEC: read this lane (one that is here); the read is not used
-        let me = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let lane = self.s.m.select(c, any, lane, me);
-        let at = self.read_active_lane(x, lane);
-        (self.s.m.select(c, any, at, first), any)
     }
 
     /// The LDS dword of `lane` (this thread's own, or a lane of its wave) of mirrored VGPR
@@ -5775,19 +5760,6 @@ impl<'a> Lower<'a> {
         let or = self.s.m.i8(1);
         self.s
             .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[mine, or])
-    }
-
-    fn read_lane(&mut self, x: V, lane: V) -> V {
-        #[cfg(test)]
-        LANE_SHUFFLES.set(LANE_SHUFFLES.get() + 1);
-        self.s.op(
-            self.cur,
-            "waveReadLaneAt.i32",
-            Attr::NoUnwind,
-            self.s.t.i32,
-            117,
-            &[x, lane],
-        )
     }
 
     /// The float value of a register value.

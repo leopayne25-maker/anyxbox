@@ -452,3 +452,49 @@ fn generated_swizzle_sweep() {
     }
     eprintln!("ran on the hardware device: the swizzle sweep");
 }
+
+
+#[test]
+fn readfirstlane_uses_the_whole_console_wave() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let mut words = vec![
+        vop2(0x1B, 1, k(63), 0), // v1 = flat thread ID modulo 64
+        sop1(0x04, 12, EXEC),    // save EXEC
+        vopc(0xD3, 0, 1),       // v_cmpx_le_u32 s0, v1
+        vop1(0x02, 6, v(0)),    // v_readfirstlane_b32 s6, v0
+        sop1(0x04, EXEC, 12),    // restore EXEC for the store
+        vop1(0x01, 2, 6),       // v_mov_b32 v2, s6
+        vop2(0x1A, 15, k(2), 0), // four bytes per thread
+    ];
+    words.extend(store(2, 15, 0));
+    let wave32 = Host::new(false).ok().is_some_and(|host| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: OPTIONS1 is filled by the matching D3D12 query.
+        let result = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        result.is_ok() && options.WaveOps.as_bool()
+            && options.WaveLaneCountMin <= 32 && options.WaveLaneCountMax >= 32
+    });
+    for threads in [64, 128] {
+        let shader = emitted(&native_of(&words, true, threads), 32);
+        if wave32 {
+            for cutoff in [0, 10, 40, 63, 64] {
+                let got = run(&shader, [cutoff, 0, 0, 0], threads).expect("dispatch on wave32");
+                let first_lane = if cutoff < 64 { cutoff } else { 0 };
+                let expected: Vec<_> = (0..threads).map(|t| (t & !63) + first_lane).collect();
+                assert_eq!(got, expected, "{threads} threads, EXEC cutoff {cutoff}");
+            }
+        }
+    }
+    if wave32 {
+        eprintln!("verified first active lanes in both halves on the wave32 device");
+    }
+}
