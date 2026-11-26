@@ -548,6 +548,65 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Whether the clock is read before a submission-time step
+/// ([`HostList::run_deferred`]): with diagnostics, for the title's work run
+/// at submission, which they sum. Title memory copies time themselves after
+/// the flush that precedes them, and upload fills are timed by the run
+/// ([`FillTimer`]); the other steps only note what to do or hand off to
+/// timings of their own. Read for every step, the clock was 2.8 % of the
+/// submitting thread's time in a profile of the world (30 s, 263 frames),
+/// most of a submission's steps being refreshes and textures.
+fn timed(step: &Step) -> bool {
+    match step {
+        Step::Run(_) | Step::Host(_) => cfg!(feature = "diagnostics"),
+        Step::Copy(..) | Step::Fill(..) | Step::Refresh(..) | Step::GpuWrite(..) | Step::Texture(_) => false,
+    }
+}
+
+/// The time and bytes of a run of upload fills ([`Step::Fill`]) in
+/// [`HostList::run_deferred`], read from the clock when the run starts and
+/// ends: some 9,700 fills a frame in the world, each under a microsecond,
+/// read the clock twice and were each counted as 0 µs (`as_micros` cuts
+/// the fraction).
+#[derive(Default)]
+struct FillTimer {
+    started: Option<std::time::Instant>,
+    bytes: u64,
+}
+
+impl FillTimer {
+    /// A fill begins (the run's first one reads the clock).
+    fn start(&mut self) {
+        if self.started.is_none() {
+            self.started = Some(std::time::Instant::now());
+        }
+    }
+
+    fn add_bytes(&mut self, len: usize) {
+        self.bytes += len as u64;
+    }
+
+    /// Ends the run: its microseconds and bytes, if there was one.
+    fn finish(&mut self) -> Option<(u64, u64)> {
+        let started = self.started.take()?;
+        Some((started.elapsed().as_micros() as u64, std::mem::take(&mut self.bytes)))
+    }
+
+    /// Ends the run into [`PREPARING`].
+    fn flush_into_preparing(&mut self) {
+        if let Some((us, bytes)) = self.finish() {
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Microseconds since `started`, if the clock was read ([`timed`]).
+#[cfg(any(feature = "diagnostics", test))]
+fn micros_since(started: Option<std::time::Instant>) -> u64 {
+    started.map_or(0, |s| s.elapsed().as_micros() as u64)
+}
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -801,6 +860,33 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// The steps whose time goes into the preparing's sums read the clock;
+    /// the title's work run at submission only with diagnostics, which sum
+    /// it. (Refreshes, shader writes and textures, which need host objects
+    /// to be made, take the `false` arm of the same match.)
+    #[test]
+    fn only_summed_steps_read_the_clock() {
+        use super::{FillTimer, Step, micros_since, timed};
+        assert!(!timed(&Step::Copy(0, 0, 0)));
+        assert!(!timed(&Step::Fill(0, 0, 0, false)));
+        assert!(!timed(&Step::Fill(0, 0, 0, true)));
+        assert_eq!(timed(&Step::Host(Box::new(|| {}))), cfg!(feature = "diagnostics"));
+        assert_eq!(timed(&Step::Run(Box::new(|| {}))), cfg!(feature = "diagnostics"));
+        assert_eq!(micros_since(None), 0);
+        let started = std::time::Instant::now() - std::time::Duration::from_millis(3);
+        assert!(micros_since(Some(started)) >= 3000);
+        // A run of fills: one start, bytes summed, ended once.
+        let mut fills = FillTimer::default();
+        assert_eq!(fills.finish(), None);
+        fills.start();
+        fills.add_bytes(64);
+        fills.start();
+        fills.add_bytes(192);
+        let (_, bytes) = fills.finish().expect("a run of fills");
+        assert_eq!(bytes, 256);
+        assert_eq!(fills.finish(), None);
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -7384,9 +7470,16 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let mut fills = FillTimer::default();
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
+            // A run of fills is timed as one; a step that does work of its
+            // own (timed apart, or not part of the copies' time) ends it.
+            if !matches!(step, Step::Fill(..) | Step::Refresh(..)) {
+                fills.flush_into_preparing();
+            }
+            // The clock only for the steps whose time is summed ([`timed`]).
+            let started = timed(step).then(std::time::Instant::now);
+            match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -7394,10 +7487,14 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    // From here: the flush before it is the refreshes' time,
+                    // which they count themselves (`Batch::update`).
+                    let copying = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
-                    len
+                    PREPARING[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[1].fetch_add(len as u64, Ordering::Relaxed);
                 }
                 &Step::Fill(dst, src, len, _) => {
                     #[cfg(feature = "diagnostics")]
@@ -7405,8 +7502,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    fills.start();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    fills.add_bytes(len);
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -7415,7 +7513,6 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
-                    continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
@@ -7430,9 +7527,8 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, micros_since(started));
                     }
-                    continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data: this copy's
@@ -7449,18 +7545,16 @@ impl HostList {
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
-                    continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
-                    continue;
                 }
-            };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
+            let _ = started;
         }
+        fills.flush_into_preparing();
     }
 }
 
