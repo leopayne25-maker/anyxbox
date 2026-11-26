@@ -2,7 +2,9 @@
 //! (host slots 0-3); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! and runs device callbacks on connect and disconnect. A pad button pressed
+//! and released between two of the title's looks at the current reading is
+//! shown to it once all the same (`State::current`).
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -60,6 +62,9 @@ const DEVICES: usize = PADS + 2;
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
+/// How long a press the title has not seen is kept for it: a few frames of
+/// a title we run slowly, not a pause in which it does not ask.
+const LATCH: Duration = Duration::from_secs(2);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
@@ -345,6 +350,49 @@ struct Slot {
     connected: bool,
     sequence: u64,
     history: VecDeque<Ref>,
+    /// Pad buttons that went down since the title last asked for the
+    /// current reading, and when the last of them did.
+    pressed: u32,
+    pressed_at: u64,
+}
+
+impl Slot {
+    /// Adds a reading, the newest from now on.
+    fn record(&mut self, device: &Device, value: Value, now: u64) {
+        self.sequence += 1;
+        if self.history.len() == HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(Ref::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(1),
+            device,
+            sequence: self.sequence,
+            timestamp: now,
+            value,
+        }));
+    }
+
+    /// The newest reading's pad state.
+    fn pad(&self) -> Option<PadState> {
+        match self.history.back()?.value {
+            Value::Pad(pad) => Some(pad),
+            Value::Keys(_) => None,
+        }
+    }
+
+    /// The pad as it is, with the buttons down that were pressed and
+    /// released since the title last asked. `None` when the newest reading
+    /// shows every press, or the presses are older than `LATCH`.
+    fn latched(&self, now: u64) -> Option<PadState> {
+        let pad = self.pad()?;
+        let missed = self.pressed & !pad.buttons;
+        let kept = Duration::from_micros(now.saturating_sub(self.pressed_at)) <= LATCH;
+        (missed != 0 && kept).then_some(PadState {
+            buttons: pad.buttons | missed,
+            ..pad
+        })
+    }
 }
 
 struct State {
@@ -509,18 +557,14 @@ impl State {
         if let Some(value) = value
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
-            slot.sequence += 1;
-            if slot.history.len() == HISTORY {
-                slot.history.pop_front();
+            if let Value::Pad(pad) = &value {
+                let down = pad.buttons & !slot.pad().map_or(0, |held| held.buttons);
+                if down != 0 {
+                    slot.pressed |= down;
+                    slot.pressed_at = now;
+                }
             }
-            slot.history.push_back(Ref::new(Reading {
-                vtable: &READING,
-                refs: AtomicU32::new(1),
-                device: &devices[index],
-                sequence: slot.sequence,
-                timestamp: now,
-                value,
-            }));
+            slot.record(&devices[index], value, now);
         }
         if was != slot.connected {
             tracing::info!(device = index, connected = !was, "input device");
@@ -536,6 +580,27 @@ impl State {
                     .map(|r| r.event(index, now, current, previous)),
             );
         }
+    }
+
+    /// Device `index`'s reading for a title that asks for the current one:
+    /// the newest. The console hands out just that, and a title that asks
+    /// once a frame misses a press shorter than its frame: rare at 30
+    /// frames a second, usual at the 2 or 3 we reach. So a pad button
+    /// pressed and released since the title last asked is shown down once,
+    /// in a reading made here (sticks and triggers as they are now); the
+    /// next poll records the host's state again, the release.
+    ///
+    /// shortcut: a reading the title walks to (next, previous) does not
+    /// count as seen, so a title that walks a pad's readings and asks for
+    /// the current one too is shown a short press twice; the title we run
+    /// asks for a pad's current reading and the one before it.
+    fn current(&mut self, devices: &[Device; DEVICES], index: usize, now: u64) -> Option<&Ref> {
+        let slot = &mut self.slots[index];
+        if let Some(pad) = slot.latched(now) {
+            slot.record(&devices[index], Value::Pad(pad), now);
+        }
+        slot.pressed = 0;
+        slot.history.back()
     }
 }
 
@@ -622,24 +687,31 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
+    let now = now();
     let newest = |i: usize| {
         state.slots[i]
             .history
             .back()
             .filter(|r| r.kind() & kind != 0)
     };
-    let found = if device.is_null() {
+    let index = if device.is_null() {
+        // A pad with a press to show comes before a newer reading.
         (0..DEVICES)
             .filter(|&i| state.slots[i].connected)
-            .filter_map(newest)
-            .max_by_key(|r| r.timestamp)
+            .filter_map(|i| Some((state.slots[i].latched(now).is_some(), newest(i)?, i)))
+            .max_by_key(|&(latched, reading, _)| (latched, reading.timestamp))
+            .map(|(_, _, i)| i)
     } else {
         match hub.index(device) {
             None => return fail(out, E_INVALIDARG),
             Some(i) if !state.slots[i].connected => return fail(out, DEVICE_DISCONNECTED),
-            Some(i) => newest(i),
+            Some(i) => newest(i).map(|_| i),
         }
+    };
+    let found = match index {
+        Some(i) => state.current(&hub.devices, i, now),
+        None => None,
     };
     tracing::trace!(
         kind = format_args!("{kind:#x}"),
@@ -1579,6 +1651,28 @@ mod tests {
         slot::<extern "system" fn(*const Reading) -> u32, _>(reading, 0x10)(reading);
     }
 
+    /// What a title sees that asks for `device`'s current reading.
+    fn look(hub: &Hub, device: usize) -> PadState {
+        let reading = current(hub, GAMEPAD_KIND, device).unwrap();
+        let state = pad(reading);
+        release(reading);
+        state
+    }
+
+    /// The host's first pad is in `state`, and a poll has seen it.
+    fn set(hub: &Hub, host: &Mutex<FakeHost>, state: PadState) {
+        host.lock().unwrap().pads[0] = Some(state);
+        hub.poll();
+    }
+
+    /// A pad at rest but for `buttons`.
+    fn held(buttons: u32) -> PadState {
+        PadState {
+            buttons,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn ordinal_one_resolves_to_create() {
         let r = HleResolver::new(HostPolicy::none());
@@ -1684,6 +1778,134 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn a_press_between_two_current_readings_is_shown_once() {
+        let (hub, host) = fake();
+        set(hub, &host, held(0));
+        assert_eq!(look(hub, 0), held(0));
+
+        // Down and up again before the title asks, the stick moved since.
+        set(hub, &host, held(A));
+        let mut moved = held(0);
+        moved.left_x = 0.5;
+        set(hub, &host, moved);
+        let pressed = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!((pad(pressed).buttons, pad(pressed).left_x), (A, 0.5));
+        // The title's edge check finds the button up in the one before.
+        let before = walk(hub, 0x30, pressed).unwrap();
+        assert_eq!(pad(before), moved);
+        // Asked again before the next poll: the same reading, no new press.
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Ok(pressed));
+        for r in [before, pressed, pressed] {
+            release(r);
+        }
+        // Once: the next poll records the release, and nothing follows.
+        hub.poll();
+        assert_eq!(look(hub, 0), moved);
+        hub.poll();
+        assert_eq!(look(hub, 0), moved);
+
+        // Beside a button the title sees held, and two at a time.
+        set(hub, &host, held(B));
+        assert_eq!(look(hub, 0), held(B));
+        for buttons in [B | X, B, B | Y, B] {
+            set(hub, &host, held(buttons));
+        }
+        assert_eq!(look(hub, 0), held(B | X | Y));
+        hub.poll();
+        assert_eq!(look(hub, 0), held(B));
+    }
+
+    #[test]
+    fn held_buttons_and_idle_pads_read_as_the_host_has_them() {
+        let (hub, host) = fake();
+        set(hub, &host, held(0));
+        // Nothing pressed: the one reading every time, nothing made up.
+        let idle = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(idle), held(0));
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Ok(idle));
+
+        // Held over several of the title's frames: down at once and in
+        // each, in the one reading the host's change made.
+        set(hub, &host, held(B));
+        let down = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(down), held(B));
+        assert_eq!(stamp(down).1, stamp(idle).1 + 1);
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Ok(down));
+
+        // Released while the title looks on: up at its next reading.
+        set(hub, &host, held(0));
+        let up = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(up), held(0));
+        assert_eq!(stamp(up).1, stamp(down).1 + 1);
+        for r in [idle, idle, down, down, up] {
+            release(r);
+        }
+    }
+
+    #[test]
+    fn a_short_key_press_reaches_the_stand_in_pad() {
+        let (hub, host) = fake();
+        assert_eq!(look(hub, FALLBACK), held(0));
+        // Enter (A) and W (left stick up) down and up before the title asks.
+        host.lock().unwrap().keys = vec![key(0x0D), key(b'W')];
+        hub.poll();
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        // The button shows; the stick is where the keys have it now.
+        assert_eq!(look(hub, FALLBACK), held(A));
+        hub.poll();
+        assert_eq!(look(hub, FALLBACK), held(0));
+    }
+
+    #[test]
+    fn a_press_from_before_a_long_pause_is_not_shown() {
+        let (hub, host) = fake();
+        for buttons in [0, A, 0] {
+            set(hub, &host, held(buttons));
+        }
+        // The title asks only after longer than a press is kept.
+        let late = now() + LATCH.as_micros() as u64 + 1;
+        let mut state = hub.state();
+        let newest = state.current(&hub.devices, 0, late).unwrap();
+        assert!(newest.value == Value::Pad(held(0)));
+        drop(state);
+        // Nor is it shown later.
+        assert_eq!(look(hub, 0), held(0));
+    }
+
+    #[test]
+    fn a_short_press_comes_before_another_pad_s_newer_reading() {
+        let (hub, host) = fake();
+        let any = || {
+            type Current = extern "system" fn(This, u32, *const Device, Out) -> HRESULT;
+            let mut out = std::ptr::null();
+            let current = slot::<Current, _>(&hub.object, 0x20);
+            let hr = current(&hub.object, GAMEPAD_KIND, std::ptr::null(), &mut out);
+            let r = result(hr, out).unwrap();
+            let seen = (reading(r).device, pad(r));
+            release(r);
+            seen
+        };
+        let (first, second) = (&raw const hub.devices[0], &raw const hub.devices[1]);
+        set(hub, &host, held(A));
+        set(hub, &host, held(0));
+        std::thread::sleep(Duration::from_millis(2));
+        let mut moved = held(0);
+        moved.left_y = 1.0;
+        host.lock().unwrap().pads[1] = Some(moved);
+        hub.poll();
+        assert_eq!(any(), (first, held(A)));
+        // With no press to show, the newest reading of any pad.
+        hub.poll();
+        std::thread::sleep(Duration::from_millis(2));
+        host.lock().unwrap().pads[1] = Some(held(0));
+        hub.poll();
+        assert_eq!(any(), (second, held(0)));
     }
 
     #[test]

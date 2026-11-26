@@ -366,7 +366,7 @@ Clavier ou manette. Sans manette XInput branchée, le clavier sert de manette ta
 | Échap | Menu |
 | Tab | View |
 
-Maintenez chaque touche un instant : le jeu lit l'entrée à 30 Hz, un appui très bref peut être manqué. Les lancements suivants reprennent directement la sauvegarde.
+Un appui bref sur un bouton de la manette, ou sur sa touche, est gardé pour la prochaine lecture de la manette par le jeu : il n'est plus manqué quand le jeu tourne à quelques images par seconde. Les sticks et les gâchettes basses sont lus tels qu'ils sont quand le jeu demande : maintenez-les un instant. Les lancements suivants reprennent directement la sauvegarde.
 
 ## Lancements scriptés et diagnostics
 

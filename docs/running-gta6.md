@@ -366,7 +366,7 @@ Keyboard or pad. With no XInput pad connected, the keyboard acts as a pad while 
 | Escape | Menu |
 | Tab | View |
 
-Hold each key for a moment: the game reads its input at 30 Hz, so a very short tap can be missed. Later launches resume directly from the save.
+A short tap of a pad button, or of its key, is kept for the game's next reading of the pad, so it is not missed when the game runs at a few frames a second. Sticks and triggers are read as they are when the game asks: hold those for a moment. Later launches resume directly from the save.
 
 ## Scripted runs and diagnostics
 
