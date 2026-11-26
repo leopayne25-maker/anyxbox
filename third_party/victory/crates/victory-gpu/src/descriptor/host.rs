@@ -3022,6 +3022,7 @@ fn buffer_uav(
         return None;
     }
     let host = host()?;
+    shadow.note_gpu_written();
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
