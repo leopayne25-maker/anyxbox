@@ -439,6 +439,8 @@ struct StageEntry {
     seq: u64,
     /// `crate::host::moment()` when returned to the pool (for idle RAM trimming).
     moment: u64,
+    /// `crate::host::now_ms()` when returned to the pool (for `TrimPolicy` idle trimming).
+    returned_ms: u64,
 }
 
 /// (Neptune) The upload buffers of staging buffers that are gone, by size class, and their
@@ -547,7 +549,14 @@ impl StagePool {
         }
         self.seq = self.seq.wrapping_add(1);
         let seq = self.seq;
-        self.free[class].push_back(StageEntry { buffer, data, seq, moment });
+        let returned_ms = crate::host::now_ms();
+        self.free[class].push_back(StageEntry {
+            buffer,
+            data,
+            seq,
+            moment,
+            returned_ms,
+        });
         self.bytes += size;
         evicted
     }
@@ -565,6 +574,41 @@ impl StagePool {
                     freed += size;
                     evicted.push(old.buffer);
                 }
+            }
+        }
+        (evicted, freed)
+    }
+
+    /// Releases oldest idle buffers across size classes using `now_ms` until cached bytes
+    /// drop to or below `warm_target` (or drains all entries when `force_empty`).
+    fn trim_idle_with(
+        &mut self,
+        warm_target: u64,
+        idle_ms: u64,
+        now: u64,
+        force_empty: bool,
+    ) -> (Vec<ID3D12Resource>, u64) {
+        let mut evicted = Vec::new();
+        let mut freed = 0u64;
+        while self.bytes > warm_target {
+            let Some((oldest_class, _)) = self
+                .free
+                .iter()
+                .enumerate()
+                .filter_map(|(c, q)| {
+                    q.front()
+                        .filter(|e| force_empty || now.saturating_sub(e.returned_ms) >= idle_ms)
+                        .map(|e| (c, (e.returned_ms, e.seq)))
+                })
+                .min_by_key(|&(_, key)| key)
+            else {
+                break;
+            };
+            if let Some(old) = self.free[oldest_class].pop_front() {
+                let size = stage_class_size(oldest_class);
+                self.bytes = self.bytes.saturating_sub(size);
+                freed += size;
+                evicted.push(old.buffer);
             }
         }
         (evicted, freed)
@@ -643,6 +687,60 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
+const STAGE_IDLE_FRAMES: u64 = 4;
+
+/// Releases cold D3D12 upload buffers from `pool` that have sat idle
+/// past [`TrimPolicy::pool_idle_ms`](crate::ram_trim::TrimPolicy::pool_idle_ms)
+/// while keeping up to [`TrimPolicy::texture_spare_warm_bytes`](crate::ram_trim::TrimPolicy::texture_spare_warm_bytes)
+/// of hot upload buffers warm. COM resources are dropped outside `pool`.
+fn trim_stage_pool_from(
+    pool: &Mutex<StagePool>,
+    policy: &crate::ram_trim::TrimPolicy,
+    now: u64,
+) {
+    let warm_limit = policy.texture_spare_warm_bytes.min(stage_pool_most());
+    let target = if policy.panic_memory { 0 } else { warm_limit };
+    let (evicted, freed_bytes) = pool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .trim_idle_with(target, policy.pool_idle_ms, now, policy.panic_memory);
+    let pool_went = evicted.len();
+    drop(evicted);
+    if pool_went > 0 {
+        crate::host::trail(|| format!("sweep: {pool_went} pooled texture staging upload buffers trimmed ({} KiB)", freed_bytes >> 10));
+    }
+    crate::ram_trim::note_pool_trimmed(freed_bytes);
+}
+
+#[cfg(test)]
+fn trim_stage_pool_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    trim_stage_pool_from(&STAGE_POOL, policy, now);
+}
+
+/// Runs upstream `#289`'s frame+age drain on `pool` first, then applies `TrimPolicy`
+/// tightening additively only under panic pressure or a shorter idle threshold.
+fn trim_pool_sweep(
+    pool: &Mutex<StagePool>,
+    policy: &crate::ram_trim::TrimPolicy,
+    now_moment: u64,
+    upstream_idle_ms: u64,
+    now_ms: u64,
+) {
+    let (evicted, pool_bytes) = pool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .trim(now_moment, upstream_idle_ms, STAGE_IDLE_FRAMES);
+    let pool_went = evicted.len();
+    drop(evicted);
+    if pool_went > 0 {
+        crate::host::trail(|| format!("sweep: {pool_went} pooled texture staging upload buffers trimmed ({} KiB)", pool_bytes >> 10));
+    }
+    crate::ram_trim::note_pool_trimmed(pool_bytes);
+    if policy.panic_memory || policy.pool_idle_ms < upstream_idle_ms {
+        trim_stage_pool_from(pool, policy, now_ms);
+    }
+}
+
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
@@ -650,44 +748,50 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    let (mut went, mut bytes) = (0u64, 0u64);
+    let upstream_idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let mut dropped_staging: Vec<Arc<Staging>> = Vec::new();
     {
         let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(map) = map.as_mut()
             && !map.is_empty()
         {
+            let idle_ms = if policy.aggressive || policy.low_memory {
+                upstream_idle_ms.min(policy.pool_idle_ms)
+            } else {
+                upstream_idle_ms
+            };
             // A list that recorded an upload or a check holds the staging until it
             // is reset: one only the table holds is named by no list, recorded or
             // running.
-            map.retain(|_, s| {
-                let keep = Arc::strong_count(s) > 1
-                    || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-                if !keep {
+            let (mut went, mut bytes) = (0u64, 0u64);
+            let mut idle_keys = Vec::new();
+            for (&key, s) in map.iter() {
+                if Arc::strong_count(s) == 1
+                    && crate::host::long_ago(s.used.load(Relaxed), idle_ms, STAGE_IDLE_FRAMES)
+                {
+                    idle_keys.push(key);
+                }
+            }
+            for key in idle_keys {
+                if let Some(s) = map.remove(&key) {
                     LET_GO[0].fetch_add(1, Relaxed);
                     LET_GO[1].fetch_add(s.bytes, Relaxed);
                     went += 1;
                     bytes += s.bytes;
+                    dropped_staging.push(s);
                 }
-                keep
-            });
+            }
+            if went > 0 {
+                crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+            }
         }
     }
-    if went > 0 {
-        crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
-    }
-    let (evicted, pool_bytes) = STAGE_POOL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .trim(crate::host::moment(), idle_ms, IDLE_FRAMES);
-    let pool_went = evicted.len();
-    drop(evicted);
-    if pool_went > 0 {
-        crate::host::trail(|| format!("sweep: {pool_went} pooled texture staging upload buffers trimmed ({} KiB)", pool_bytes >> 10));
-    }
+    // Drop `Arc<Staging>` outside `STAGING` mutex so `Staging::drop` (which
+    // locks `STAGE_POOL` or releases COM resources) runs outside `STAGING`.
+    drop(dropped_staging);
+    trim_pool_sweep(&STAGE_POOL, policy, crate::host::moment(), upstream_idle_ms, now);
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
@@ -2224,5 +2328,155 @@ mod stage_pool_tests {
         assert!(freed1 > 0, "phase-1 4 MiB buffers should trim after 10 s idle");
         assert_eq!(bytes_mid_trim, p2_size, "recent 1 MiB phase-2 buffer should survive partial trim");
         assert_eq!(bytes_after_trim, 0, "all idle pooled upload buffers should trim to 0 bytes");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ram_trim_tests {
+    use super::*;
+    use crate::ram_trim::{HostTier, MIB, TrimPolicy};
+
+    #[test]
+    fn stage_pool_trim_reclaims_only_cold_staging_buffers() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (class, size) = stage_class(MIB as u64);
+        assert_eq!(size, MIB as u64);
+        let mut buffers = Vec::new();
+        for _ in 0..3 {
+            let Some((buf, data)) = host.upload_buffer(size) else {
+                return;
+            };
+            buffers.push((buf, data));
+        }
+
+        let before_trimmed = crate::ram_trim::COUNTERS
+            .pool_trimmed_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let base_now = 1_000_000u64;
+        {
+            let mut pool = STAGE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            pool.free.clear();
+            pool.bytes = 0;
+            pool.free.resize_with(class + 1, std::collections::VecDeque::new);
+            for (i, (buf, data)) in buffers.into_iter().enumerate() {
+                let ts = if i < 2 { base_now } else { base_now + 20_000 };
+                pool.free[class].push_back(StageEntry {
+                    buffer: buf,
+                    data: data as usize,
+                    seq: i as u64 + 1,
+                    moment: 0,
+                    returned_ms: ts,
+                });
+                pool.bytes += size;
+            }
+        }
+
+        let policy = TrimPolicy {
+            aggressive: false,
+            tier: HostTier::Standard32,
+            low_memory: false,
+            panic_memory: false,
+            pool_idle_ms: 10_000,
+            shadow_pool_warm_bytes: 0,
+            shadow_pool_reserve_slots: 0,
+            scratch_spare_warm_bytes: 0,
+            texture_spare_warm_bytes: size,
+            list_idle_warm_count: 0,
+            list_idle_ms: 0,
+            shader_dxil_idle_ms: 0,
+            shader_container_idle_ms: 0,
+            decommit_cold_reference_ms: None,
+            fetched_warm_bytes: 0,
+        };
+        trim_stage_pool_with(&policy, base_now + 21_000);
+
+        let remaining_bytes = {
+            let mut pool = STAGE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let rem = pool.bytes;
+            assert_eq!(pool.free[class].len(), 1);
+            assert_eq!(pool.free[class].front().expect("fresh entry").returned_ms, base_now + 20_000);
+            pool.free.clear();
+            pool.bytes = 0;
+            rem
+        };
+        assert_eq!(remaining_bytes, size);
+        let after_trimmed = crate::ram_trim::COUNTERS
+            .pool_trimmed_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after_trimmed >= before_trimmed + (2 * size));
+    }
+
+    #[test]
+    fn stage_pool_sweep_preserves_upstream_drain_and_tightens_under_policy() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (class, size) = stage_class(MIB as u64);
+        let pool = Mutex::new(StagePool::new());
+        let base_now = 2_000_000u64;
+
+        // 1. Default mode: `#289` (`StagePool::trim`) drains stale entries all the way to 0 B
+        // even when `texture_spare_warm_bytes` (64 MiB) exceeds pool size and `pool_idle_ms` is 15 s.
+        for seq in 1..=2u64 {
+            let Some((buf, data)) = host.upload_buffer(size) else {
+                return;
+            };
+            pool.lock().unwrap_or_else(|e| e.into_inner()).free.resize_with(class + 1, std::collections::VecDeque::new);
+            pool.lock().unwrap_or_else(|e| e.into_inner()).free[class].push_back(StageEntry {
+                buffer: buf,
+                data: data as usize,
+                seq,
+                moment: (1u64 << 32) | 10,
+                returned_ms: base_now,
+            });
+            pool.lock().unwrap_or_else(|e| e.into_inner()).bytes += size;
+        }
+        let default_policy = TrimPolicy::for_host(false, 32 * crate::ram_trim::GIB, 16 * crate::ram_trim::GIB, 16 * crate::ram_trim::GIB);
+        let before_default = crate::ram_trim::COUNTERS
+            .pool_trimmed_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        trim_pool_sweep(&pool, &default_policy, (6u64 << 32) | 120, 10_000, base_now + 11_000);
+        assert_eq!(pool.lock().unwrap_or_else(|e| e.into_inner()).bytes, 0, "default mode must preserve #289 full 0-byte idle drain");
+        assert!(
+            crate::ram_trim::COUNTERS
+                .pool_trimmed_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= before_default + (2 * size)
+        );
+
+        // 2. Aggressive tightening (`pool_idle_ms < upstream_idle_ms`): entries not yet past
+        // `#289`'s 4-frame / 10 s guard are trimmed down to `texture_spare_warm_bytes`, then
+        // drained to 0 under `panic_memory`.
+        for (i, ts) in [base_now, base_now + 4_500].into_iter().enumerate() {
+            let Some((buf, data)) = host.upload_buffer(size) else {
+                return;
+            };
+            let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+            guard.free.resize_with(class + 1, std::collections::VecDeque::new);
+            guard.free[class].push_back(StageEntry {
+                buffer: buf,
+                data: data as usize,
+                seq: (i + 1) as u64,
+                moment: (5u64 << 32) | 100,
+                returned_ms: ts,
+            });
+            guard.bytes += size;
+        }
+        let mut agg_policy = TrimPolicy::for_host(true, 32 * crate::ram_trim::GIB, 16 * crate::ram_trim::GIB, 16 * crate::ram_trim::GIB);
+        agg_policy.pool_idle_ms = 2_000;
+        agg_policy.texture_spare_warm_bytes = size;
+        trim_pool_sweep(&pool, &agg_policy, (6u64 << 32) | 130, 10_000, base_now + 5_000);
+        {
+            let guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(guard.bytes, size, "aggressive policy must trim cold entry down to warm ceiling");
+            assert_eq!(guard.free[class].front().expect("warm entry").returned_ms, base_now + 4_500);
+        }
+
+        agg_policy.panic_memory = true;
+        trim_pool_sweep(&pool, &agg_policy, (6u64 << 32) | 130, 10_000, base_now + 5_000);
+        assert_eq!(pool.lock().unwrap_or_else(|e| e.into_inner()).bytes, 0, "panic_memory must drain pool to 0 B");
     }
 }

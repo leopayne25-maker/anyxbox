@@ -64,7 +64,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+        .any(|s| s.stage == "compute" && s.with_container(|b| b.windows(name.len()).any(|w| w == name)))
 }
 
 /// Whether a shader is left out for what it costs the host's driver:

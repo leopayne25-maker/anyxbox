@@ -126,7 +126,7 @@ fn scratch_pool_reuses_small_chunks_after_large_burst() {
     let idle_small = spare
         .kept
         .iter()
-        .filter(|(_, size)| *size == SCRATCH_FIRST)
+        .filter(|(_, size, _)| *size == SCRATCH_FIRST)
         .count();
     eprintln!(
         "cap_bytes={SPARE_MOST}, small_buffers_created={created}, created_bytes={created_bytes}, reuse_hits={reused}, idle_small={idle_small}, idle_bytes={}, verified_bytes={}",

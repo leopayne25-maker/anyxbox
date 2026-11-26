@@ -67,6 +67,7 @@ mod memory;
 mod merge;
 #[cfg(windows)]
 mod ramline;
+mod ram_trim;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
