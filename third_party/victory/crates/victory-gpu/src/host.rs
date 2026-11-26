@@ -7906,21 +7906,75 @@ unsafe extern "system" {
 /// title's big pools, see [`copy_mapped`]): putting back what shaders wrote
 /// cost 1.2-1.9 s a frame for 430-800 pieces, 2 ms each whatever their size
 /// (run 24). On by default; `VICTORY_DIRECT_WRITES=0` writes as before.
-fn direct_writes() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
+///
+/// Under Wine a write into our own process (`NtWriteVirtualMemory`) is a
+/// round trip to wineserver, which copies the bytes through its socket, while
+/// a read into our own memory (`ReadProcessMemory`) is a `memmove` in the
+/// process; the kernel checks the destination the same way. Measured on
+/// GE-Proton11-14: 118 us per 64 KiB written, 19 us read; in the world,
+/// copying back fell from 246-277 to 116 ms a frame for the same 74 MB. So
+/// under Wine the bytes land with a read unless `VICTORY_DIRECT_WRITES=1`
+/// asks for the write; `VICTORY_DIRECT_WRITES=read` reads on Windows too.
+fn write_way() -> WriteWay {
+    static MODE: OnceLock<WriteWay> = OnceLock::new();
+    *MODE.get_or_init(|| write_way_from(std::env::var("VICTORY_DIRECT_WRITES").ok().as_deref(), on_wine()))
+}
+
+/// [`write_way`] for a value of `VICTORY_DIRECT_WRITES` (unset: `None`).
+fn write_way_from(value: Option<&str>, wine: bool) -> WriteWay {
+    match value {
+        Some("0") => WriteWay::Wrapper,
+        Some("read") => WriteWay::Read,
+        Some(_) => WriteWay::Direct,
+        None if wine => WriteWay::Read,
+        None => WriteWay::Direct,
+    }
+}
+
+/// How [`write_mapped`] puts bytes into title memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteWay {
+    /// `WriteProcessMemory`, which asks what the pages are first.
+    Wrapper,
+    /// `NtWriteVirtualMemory`.
+    Direct,
+    /// `ReadProcessMemory` from the host copy into title memory.
+    Read,
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+fn on_wine() -> bool {
+    static WINE: OnceLock<bool> = OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
 }
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    write_mapped_as(write_way(), dst, src, len);
+}
+
+/// [`write_mapped`] with a given way of landing the bytes.
+fn write_mapped_as(mode: WriteWay, dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
-        if direct {
+        if mode == WriteWay::Read {
+            // The kernel checks that the destination is mapped and writable
+            // (the caller opened its guards: `crate::watch::writing`) and
+            // copies nothing if it is not.
+            return read(from, at as *mut u8, n);
+        }
+        if mode == WriteWay::Direct {
             // SAFETY: as below; the kernel checks the destination and
             // writes nothing it cannot (the caller opened its guards:
             // `crate::watch::writing`).
@@ -9474,5 +9528,41 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod write_way_tests {
+    use super::{WriteWay, write_mapped_as, write_way_from};
+
+    #[test]
+    fn wine_lands_by_reading_unless_told_otherwise() {
+        assert_eq!(write_way_from(None, true), WriteWay::Read);
+        assert_eq!(write_way_from(None, false), WriteWay::Direct);
+        assert_eq!(write_way_from(Some("1"), true), WriteWay::Direct);
+        assert_eq!(write_way_from(Some("0"), true), WriteWay::Wrapper);
+        assert_eq!(write_way_from(Some("read"), false), WriteWay::Read);
+    }
+
+    #[test]
+    fn every_landing_writes_mapped_pages_and_skips_holes() {
+        use windows_sys::Win32::System::Memory::*;
+        const PIECE: usize = 64 << 10;
+        for mode in [WriteWay::Wrapper, WriteWay::Direct, WriteWay::Read] {
+            // SAFETY: a private reservation of three pieces; the first and
+            // last are committed and only those are read back.
+            unsafe {
+                let base = VirtualAlloc(std::ptr::null(), 3 * PIECE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+                assert!(!base.is_null());
+                for at in [base, base.add(2 * PIECE)] {
+                    assert_eq!(VirtualAlloc(at.cast(), PIECE, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                }
+                let src: Vec<u8> = (0..3 * PIECE).map(|i| (i % 251) as u8).collect();
+                write_mapped_as(mode, base, src.as_ptr(), 3 * PIECE);
+                assert_eq!(std::slice::from_raw_parts(base, PIECE), &src[..PIECE], "{mode:?}");
+                assert_eq!(std::slice::from_raw_parts(base.add(2 * PIECE), PIECE), &src[2 * PIECE..], "{mode:?}");
+                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
+        }
     }
 }

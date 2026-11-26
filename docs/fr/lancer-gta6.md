@@ -68,6 +68,7 @@ Variables lues par ce code. `tools/lancer_victory.ps1` n'en pose aucune : un lan
 | `VICTORY_L7_<NOM>` (`DYNAMIC_SLOTS`, `CB_SLOTS`, `VIEW_COPY_LRU`, `VIEW_ADDRESS`, `TEXTURE_SLOTS`), `VICTORY_L7_VIEW_COPY_MB` | actives, `512` | Cases et copies des vues ; `0` en coupe une. |
 | `VICTORY_L9_DSTORAGE_GUARDS`, `VICTORY_L9_GUARD_TITLE_VIEWS` | actives | Gardes ouvertes pendant les écritures noyau ; les gardes n'arment que les vues du titre. |
 | `VICTORY_TEXTURE_SWEEP` | active | Vues de textures placées perdues remises dans la file ; `0` coupe, `count` compte seulement. |
+| `VICTORY_DIRECT_WRITES` | `read` sous Wine, sinon `1` | Comment le retour de copie pose dans la mémoire du titre ce que les shaders ont écrit : `read` (une lecture depuis la copie hôte ; sous Wine un `memmove` dans le processus), `1` (`NtWriteVirtualMemory` ; sous Wine un aller-retour au wineserver), `0` (`WriteProcessMemory`). |
 | `VICTORY_TEXTURE_GATE_S`, `VICTORY_PIPELINE_GATE_S` | `60`, `120` | Secondes par lancement passées à charger une longue file de textures, ou à attendre des pipelines pendant le chargement d'un monde ; `0` jamais. |
 | `VICTORY_RT_RESOLVE` | non posée | Les programmes de résolution du ray tracing ne sont créés qu'avec `1` (ou `VICTORY_BVH_BUILDER=1`). |
 | `VICTORY_L9_ALIAS_UNCLEAN`, `VICTORY_HEAP_RECHECK` | coupées | `1` en active une. Coupées exprès : sous Linux, le lancement 28 (les deux actives) a perdu la géométrie des visages et le lancement 30 (`HEAP_RECHECK` active) a noirci la peau des visages (observé). |

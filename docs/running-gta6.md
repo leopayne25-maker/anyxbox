@@ -68,6 +68,7 @@ Switches read by this code. `tools/lancer_victory.ps1` sets none of them, so a l
 | `VICTORY_L7_<NAME>` (`DYNAMIC_SLOTS`, `CB_SLOTS`, `VIEW_COPY_LRU`, `VIEW_ADDRESS`, `TEXTURE_SLOTS`), `VICTORY_L7_VIEW_COPY_MB` | on, `512` | View slots and copies; `0` turns one off. |
 | `VICTORY_L9_DSTORAGE_GUARDS`, `VICTORY_L9_GUARD_TITLE_VIEWS` | on | Guards held open over kernel writes; guards arm title views only. |
 | `VICTORY_TEXTURE_SWEEP` | on | Lost placed texture views put back into the queue; `0` off, `count` only counts. |
+| `VICTORY_DIRECT_WRITES` | `read` under Wine, else `1` | How copy-back lands what shaders wrote into title memory: `read` (a read from the host copy; under Wine a `memmove` in the process), `1` (`NtWriteVirtualMemory`; under Wine a round trip to wineserver), `0` (`WriteProcessMemory`). |
 | `VICTORY_TEXTURE_GATE_S`, `VICTORY_PIPELINE_GATE_S` | `60`, `120` | Seconds per run spent bringing in a long texture queue, or waiting for pipelines while a world loads; `0` never. |
 | `VICTORY_RT_RESOLVE` | not set | Ray-tracing resolve programs are made only with `1` (or `VICTORY_BVH_BUILDER=1`). |
 | `VICTORY_L9_ALIAS_UNCLEAN`, `VICTORY_HEAP_RECHECK` | off | `1` turns one on. Off on purpose: on Linux, run 28 (both on) lost the characters' face geometry and run 30 (`HEAP_RECHECK` on) blackened face skin (observed). |
