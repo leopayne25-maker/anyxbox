@@ -3781,9 +3781,9 @@ impl<'a> Lower<'a> {
 
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
     /// wave holds a 32-aligned run of console lanes (in the paired form, the lane being
-    /// lowered). Without `exchange` or the paired form: the host lane.
+    /// lowered). Without split 32-lane waves or the paired form: the host lane.
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() && self.twin.is_none() {
+        if self.exchange.is_none() && self.halves.is_none() && self.twin.is_none() {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
@@ -3988,7 +3988,7 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
-        let lane = if self.exchange.is_some() || self.twin.is_some() {
+        let lane = if self.exchange.is_some() || self.halves.is_some() || self.twin.is_some() {
             self.console_lane()
         } else {
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
@@ -6799,8 +6799,12 @@ impl<'a> Lower<'a> {
         if let Some((rows, banks)) = masks {
             // Row (16 lanes) and bank (4 lanes of a row) write masks.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            // (in the paired form rows 2 and 3 are the upper lanes')
-            let row_lane = if self.twin.is_some() { self.console_lane() } else { lane };
+            // (in wave64 on 32-lane host waves — paired or split — rows 2 and 3 are lanes 32..63)
+            let row_lane = if self.exchange.is_some() || self.halves.is_some() || self.twin.is_some() {
+                self.console_lane()
+            } else {
+                lane
+            };
             let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);

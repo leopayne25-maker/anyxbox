@@ -1162,3 +1162,61 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+/// A console wave64 compute shader using DPP `row_mask` (0x6: rows 1 and 2, i.e. console
+/// lanes 16..47) lowered to two 32-lane host waves on a 32-lane host (both without and with
+/// cross-half `exchange`): the upper host wave holds console rows 2 and 3, so `row_mask` must
+/// test `console_lane() >> 4` rather than the 0..31 host lane index.
+#[test]
+fn wave64_dpp_row_mask_uses_console_rows_in_split_32_lane_waves() {
+    for with_exchange in [false, true] {
+        let mut w = vop3(0x169, 1, v(0), k(3)).to_vec(); // v_mul_lo_u32 v1, v0, 3
+        w.extend([
+            vop2(0x25, 1, k(1), 1), // v_add_nc_u32 v1, 1, v1
+            vop1(0x01, 4, LIT),     // v_mov_b32 v4, 1000
+            1000,
+            vop1(0x01, 4, 0xFA), // v_mov_b32 v4, v1 row_shr:1 row_mask:0x6 bank_mask:0xf
+            0x6 << 28 | 0xF << 24 | 0x111 << 8 | 1,
+        ]);
+        if with_exchange {
+            w.extend([
+                vopc(0xC1, LIT, 4), // v_cmp_lt_u32 vcc, 500, v4
+                500,
+                sop1(0x10, 16, VCC), // s_bcnt1_i32_b64 s16, vcc
+                vop1(0x01, 5, 16),   // v_mov_b32 v5, s16
+            ]);
+        } else {
+            w.push(vop1(0x01, 5, k(0))); // v_mov_b32 v5, 0
+        }
+        w.extend(stores([4, 5, 1, 0]));
+        let native = native_with(&w, true, 64, 0);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let bytes = crate::dxbc::build(&[]);
+        let c = super::Container::parse(&bytes).expect("container");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let shader = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVE.set(was);
+        let shader = shader.expect("emit");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let x = |n: u32| 3 * n + 1;
+        let shifted = |n: u32| if matches!(n >> 4, 1 | 2) && n & 15 != 0 { x(n - 1) } else { 1000 };
+        let count = if with_exchange {
+            (0..64u32).filter(|&n| shifted(n) > 500).count() as u32
+        } else {
+            0
+        };
+        let want: Vec<u32> = (0..64u32)
+            .flat_map(|n| [shifted(n), count, x(n), n])
+            .collect();
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+        same_as_console(&got, &want);
+        eprintln!("ran on the hardware device (with_exchange={with_exchange}): DPP row_mask matched console rows 0..3");
+    }
+}
