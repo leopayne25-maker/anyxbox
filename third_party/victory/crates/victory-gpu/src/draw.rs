@@ -11,6 +11,8 @@
 #[cfg(test)]
 mod heap_texture_tests;
 mod root_slots;
+#[cfg(all(test, windows))]
+mod texture_read_tests;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4007,19 +4009,24 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
-            {
+            // One lookup of the host copy (and twin) for the upload, the
+            // twin and the state: each lookup takes the texture's lock, and
+            // the copy's flags are kept, not asked of the driver.
+            let Some((copy, twin)) = crate::resource::host_side(*resource as This) else {
+                return;
+            };
+            if !aliased && copy.title_written() {
                 // Of a texture the title placed, the mips the view shows.
                 let first = match (&placed, view) {
                     (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
                     _ => 0,
                 };
-                crate::texture::upload_from(list, *resource as This, t, first);
+                crate::texture::upload_from(list, *resource as This, &copy.texture, first);
             }
             // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
+            if let Some(twin) = &twin {
+                list.twin_use_held(&copy, twin, false, false);
+            }
             // The depth target the draw only tests is read in both ways at
             // once: both read states, which its preparation asks for too.
             let (tested, _) = TESTED_DEPTH.get();
@@ -4029,7 +4036,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            crate::list::ensure_held_state(list, &copy, state);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
