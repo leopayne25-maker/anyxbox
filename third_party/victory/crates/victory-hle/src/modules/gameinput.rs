@@ -109,8 +109,12 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
-    /// Keys held down; none while the title's window lacks focus.
-    fn keys(&mut self) -> Vec<KeyState>;
+    /// Keys from VICTORY_KEYS, sampled once for both keyboard and gamepad.
+    fn scripted_keys(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    /// Keys held down, including the supplied scripted keys.
+    fn keys(&mut self, scripted: Vec<u8>) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -432,12 +436,17 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, scripted_buttons) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let scripted = source.scripted_keys();
+            let scripted_buttons = FALLBACK_BUTTONS
+                .iter()
+                .filter(|(key, _)| scripted.contains(key))
+                .fold(0, |all, &(_, button)| all | button);
+            (pads, source.keys(scripted), scripted_buttons)
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, scripted_buttons);
         self.deliver(events);
     }
 
@@ -481,8 +490,9 @@ impl State {
         &mut self,
         devices: &[Device; DEVICES],
         one_pad: bool,
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted_buttons: u32,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -492,7 +502,11 @@ impl State {
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
-        let any_pad = pads.iter().any(Option::is_some);
+        let first_pad = pads.iter_mut().flatten().next();
+        let any_pad = first_pad.is_some();
+        if let Some(pad) = first_pad {
+            pad.buttons |= scripted_buttons;
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
@@ -560,7 +574,7 @@ fn host() -> Box<dyn Source> {
         fn pad(&mut self, _: usize) -> Option<PadState> {
             None
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, _: Vec<u8>) -> Vec<KeyState> {
             Vec::new()
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
@@ -1193,24 +1207,14 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
-            if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
-            }
-            Some(pad)
+            Some(convert(&state.Gamepad))
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
-            let mut down = scripted();
+        fn scripted_keys(&self) -> Vec<u8> {
+            scripted()
+        }
+
+        fn keys(&mut self, mut down: Vec<u8>) -> Vec<KeyState> {
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1331,6 +1335,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted: Vec<u8>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1340,7 +1345,10 @@ mod tests {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn scripted_keys(&self) -> Vec<u8> {
+            self.0.lock().unwrap().scripted.clone()
+        }
+        fn keys(&mut self, _: Vec<u8>) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1536,6 +1544,46 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn auto_a_taps_the_first_connected_pad() {
+        let (hub, host) = fake();
+        let physical = PadState {
+            buttons: B,
+            left_x: 0.5,
+            right_trigger: 0.75,
+            ..Default::default()
+        };
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[1] = Some(physical);
+            host.pads[3] = Some(PadState::default());
+            host.scripted.push(0x0D);
+            // The automatic tap appears as Enter in the keyboard sample.
+            host.keys = vec![key(0x0D)];
+        }
+        let sample = |device| {
+            let reading = current(hub, GAMEPAD_KIND, device).unwrap();
+            let state = pad(reading);
+            release(reading);
+            state
+        };
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            sample(1),
+            PadState {
+                buttons: A | B,
+                ..physical
+            }
+        );
+        assert_eq!(sample(3), PadState::default());
+
+        // A held Enter key is still only a keyboard input while a real pad is connected.
+        host.lock().unwrap().scripted.clear();
+        hub.poll();
+        assert_eq!(sample(1), physical);
     }
 
     #[test]

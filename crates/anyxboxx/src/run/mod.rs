@@ -59,7 +59,8 @@ pub struct RunArgs {
     /// KEY=VALUE VICTORY_* variables set after the tuned set and --quality, for A/B runs. Repeatable.
     #[arg(long = "override", alias = "Override", value_parser = parse_override)]
     pub overrides: Vec<(String, String)>,
-    /// Taps Enter (also the first pad's A) every 4 s through the start screens for 150 s (VICTORY_KEYS).
+    /// Taps Enter every 4 s for 150 s (VICTORY_KEYS) and presses A on the
+    /// first connected pad, or on the keyboard's stand-in pad.
     #[arg(long, alias = "AutoA")]
     pub auto_a: bool,
     /// Build and run the diag profile with the diagnostics feature instead of the release build.
