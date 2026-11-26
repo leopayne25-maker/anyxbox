@@ -65,7 +65,7 @@ def rust_table(name):
 
 def test_the_rust_tuned_table_is_the_golden_scripts_table():
     assert rust_table("TUNED") == golden_tuned()
-    assert len(golden_tuned()) == 46
+    assert len(golden_tuned()) == 47
 
 
 def test_the_rust_quality_set_is_the_golden_scripts_quality_set():

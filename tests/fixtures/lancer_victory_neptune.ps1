@@ -192,6 +192,7 @@ if (-not $NoTunedSettings) {
         VICTORY_CARD_SYNC_BATCH          = '1'         # card copies recorded in three steps (#383)
         VICTORY_PARALLEL_REFRESH         = '1'         # texture checks on the helper pool (#383)
         VICTORY_HEAP_SCAN_ALT            = '1'         # full heap scan every 16 passes, not every pass
+        VICTORY_TEXTURE_PREPARE_THREADS  = '2'         # textures picked by index made ready off the recording thread (#395)
     }
     foreach ($name in $tuned.Keys) {
         Set-Item -Path "Env:$name" -Value $tuned[$name]

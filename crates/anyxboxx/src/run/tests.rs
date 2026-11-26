@@ -58,7 +58,7 @@ fn tuned_settings_are_set_by_default_and_can_be_turned_off() {
 #[test]
 fn the_tuned_set_is_neptune_s_measured_set() {
     // Golden copy: tests/fixtures/lancer_victory_neptune.ps1 (checked in tests/test_anyxboxx_run.py).
-    assert_eq!(TUNED.len(), 46);
+    assert_eq!(TUNED.len(), 47);
     assert!(TUNED.contains(&("VICTORY_HEAP_PASS_DIRTY", "1")));
     assert!(TUNED.contains(&("VICTORY_CARD_WINDOWS_MB", "1536")));
     assert!(TUNED.contains(&("VICTORY_RELAY", "2")));

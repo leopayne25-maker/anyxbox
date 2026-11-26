@@ -59,6 +59,8 @@ pub const TUNED: &[(&str, &str)] = &[
     ("VICTORY_PARALLEL_REFRESH", "1"),
     // The full scan of kept heap slots every 16 passes instead of every pass, measured 2026-11-26 in one run alternating every 20 s (RTX 4070 SUPER, Series X): 14.2 -> 15.2 fps median, frames over 100 ms 4 -> 1.
     ("VICTORY_HEAP_SCAN_ALT", "1"),
+    // PR #395: textures picked by index made ready on two threads of their own, measured 2026-11-26 in two 9-minute runs (RTX 5080, Series X): longest texture pass 1,576 -> 213 ms, 10th-percentile fps 1.4 -> 4.1.
+    ("VICTORY_TEXTURE_PREPARE_THREADS", "2"),
 ];
 
 /// Linux (Proton) + AMD measured set (PR #199, RX 9070 XT / RADV / vkd3d-proton).
