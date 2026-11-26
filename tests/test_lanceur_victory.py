@@ -91,7 +91,9 @@ def test_launcher_sets_the_measured_switch_set_and_can_turn_it_off():
 def test_launcher_takes_the_series_x_path_and_taps_a_only_when_asked():
     texte = _lanceur()
     poses = _variables_posees(texte)
-    assert "VICTORY_FSR_DLL" not in poses and "series-s" not in texte   # pas de DLL FidelityFX PC : chemin Series X
+    assert "VICTORY_FSR_DLL" not in poses   # pas de DLL FidelityFX PC : chemin Series X
+    # Series X par défaut ; la Series S seulement avec -Console SeriesS, dans une seule branche.
+    assert "[string]$Console = 'SeriesX'" in texte and texte.count("series-s") == 1
     assert "VICTORY_AUTO_A" not in _table(texte)
     assert "[switch]$AutoA" in texte
     assert re.search(r"if \(\$AutoA\) \{\s*\$env:VICTORY_AUTO_A = '150'", texte)
@@ -266,6 +268,13 @@ ECHO_DEFAUT = ("VICTORY_CARD_WINDOWS_MB", "VICTORY_CARD_BUFFERS_MB", "VICTORY_LI
 def _valeurs(sortie):
     """Lignes « NOM=valeur » affichées par le faux victory.exe."""
     return dict(ligne.split("=", 1) for ligne in sortie.splitlines() if "=" in ligne and ligne.startswith("VICTORY_"))
+
+
+def test_console_series_s_runs_the_title_as_a_series_s(tmp_path, faux_outil):
+    # -Console SeriesS : victory run --console series-s (1280x720 au lieu de 4K) ; sans lui, la commande reste la même.
+    fini, appels, _, jeu = _lancer(tmp_path, faux_outil, options=("-Console", "SeriesS"))
+    assert appels[1] == f"victory run {jeu / 'game_scarlett_master.exe'} --execute --console series-s", (appels, fini.stderr)
+    assert fini.returncode == CODE_SORTIE_VICTORY
 
 
 def test_launcher_defaults_are_the_measured_fast_set(tmp_path, faux_outil):

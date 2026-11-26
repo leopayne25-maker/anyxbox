@@ -327,6 +327,8 @@ These values are unchanged since the 57 Proton and AMD commits: they are the mai
 
 `-Quality` applies the picture-first set on top of the defaults: `VICTORY_CARD_WINDOWS_MB=0` (windows are read fresh each frame instead of kept as card copies), `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_LIST_POOL_MOST=256`, `VICTORY_LIST_POOL_MB=256` and `VICTORY_TEXTURE_STAGE_MB=192`. It costs about half the frame rate: measured about 7 to 9 fps against 14 to 17, with 51 to 93 texture refusals against 296 (log auto-ram-2326, measured by the maintainer; the picture is judged better, with lighting, shadows and textures, observed). `-Override` still wins over it.
 
+`-Console SeriesS` runs the title as a Series S (`victory run --console series-s`; `SeriesX` is the default): it renders at 1280x720 instead of 4K. Measured on an RTX 5080 and a Ryzen 7 9800X3D in the world: 20.3 to 21.6 fps against 17.5 to 17.8 as a Series X, the card about a third busy. Frame rate first, picture second.
+
 `-Dred` sets `VICTORY_D3D12_DRED=1` (device-removed data) to diagnose a device loss. It is off by default: VIctory turns it on whenever the variable exists, and it notes every command list operation, which slows each frame.
 
 `-XgDll <path to xg_xs.dll>` sets `VICTORY_XG_DLL`: your own copy of the GDK's offline PC texture layout library lays out the title's textures (see the batch 8 and texture layout library section above). `-XgMode compare` (`VICTORY_XG_MODE`) keeps VIctory's layouts and logs every difference with the library instead; `real` is the default. Never copy the DLL into this repository.

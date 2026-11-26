@@ -59,6 +59,11 @@
   about half the frame rate: measured about 7 to 9 fps against 14 to 17 for the default set, with 51 to 93 texture
   refusals against 296 (run auto-ram-2326). Picture first, frame rate second.
 
+.PARAMETER Console
+  Optional. SeriesX (default) or SeriesS: the console the title is run as ('victory run --console'). As a Series S the
+  title renders at 1280x720 instead of 4K: measured on an RTX 5080 and a Ryzen 7 9800X3D, the world at 20.3 to 21.6 fps
+  against 17.5 to 17.8 as a Series X, the card about a third busy. Frame rate first, picture second.
+
 .NOTES
   The switch set is Neptune (VIctory Edit.) 2026-11-25c's play.ps1 for the Series X path (no PC FidelityFX DLL, no
   VICTORY_AUTO_A unless -AutoA), with the measured changes of 2026-11-25 on top (heap pass on dirty slots, copy
@@ -90,6 +95,7 @@ param(
     [ValidateSet('real', 'compare')][string]$XgMode = 'real',
     [switch]$BatchCardRehash,
     [switch]$Quality,
+    [ValidateSet('SeriesX', 'SeriesS')][string]$Console = 'SeriesX',
     [hashtable]$Override = @{}
 )
 
@@ -267,7 +273,11 @@ if ($Precompile) {
 $prevErrorAction = $ErrorActionPreference
 try {
     $ErrorActionPreference = 'Continue'
-    & $exe run $gameExe --execute
+    if ($Console -eq 'SeriesS') {
+        & $exe run $gameExe --execute --console series-s
+    } else {
+        & $exe run $gameExe --execute
+    }
 } finally {
     $ErrorActionPreference = $prevErrorAction
 }
