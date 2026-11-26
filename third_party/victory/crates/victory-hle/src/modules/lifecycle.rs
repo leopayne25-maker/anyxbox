@@ -1,7 +1,8 @@
 //! The title's life cycle. A console title is never told it is closing:
 //! quitting it or launching a new game first suspends it (its suspend
 //! routines run, and it has a second to save) and then ends the process.
-//! Closing the title's window does the same here; a new launch then starts
+//! Closing the title's window does the same here, with more than the second
+//! for a title we run slowly (`stretched`); a new launch then starts
 //! `victory` again, which waits for this process to be gone.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -10,7 +11,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
@@ -28,8 +29,59 @@ fn routines() -> MutexGuard<'static, Vec<(usize, Routine, usize)>> {
     ROUTINES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How long the console lets suspend routines run before it ends the title.
+/// How long the console lets suspend routines run before it ends the title:
+/// "The app is terminated if it takes too long to suspend. The limit is
+/// 1 second for an exclusive app" (a game), in Microsoft's GDK reference for
+/// `IXtfApplicationClient::DebugEnable` on Microsoft Learn.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Frames a console title presents in that second, at 30 a second.
+const SUSPEND_FRAMES: u32 = 30;
+
+/// The time to suspend for a title that presented `frames` frames in the
+/// console's `deadline`. A title hands the suspend to the threads that make
+/// its frames and waits for them; one we run at 2 frames a second gets
+/// through 2 of them where the console gives it 30. So a slow title gets
+/// the time to present as many as on the console, at the rate it showed:
+/// 15 s at 2 frames a second, 30 times the deadline at most. One that
+/// presented none gets no more: it may be stuck, and has to end as well.
+fn stretched(deadline: Duration, frames: u64) -> Duration {
+    match u32::try_from(frames) {
+        Ok(frames @ 1..SUSPEND_FRAMES) => deadline * SUSPEND_FRAMES / frames,
+        _ => deadline,
+    }
+}
+
+/// `VICTORY_SUSPEND_MS=<milliseconds>` gives the title that long to suspend
+/// instead, whatever its frame rate.
+fn asked(value: &str) -> Option<Duration> {
+    let ms = value.trim().parse::<u32>().ok()?;
+    Some(Duration::from_millis(ms.into()))
+}
+
+/// Runs the suspend routines and waits for them to return: for `deadline`
+/// and, if they still run then, until `longer()` (asked then) after the
+/// start. Whether they returned. They run on a thread of their own: titles
+/// hand the suspend to their window thread and wait for it inside the
+/// routine.
+fn suspend(
+    routines: Vec<(usize, Routine, usize)>,
+    deadline: Duration,
+    longer: impl FnOnce() -> Duration,
+) -> bool {
+    let start = Instant::now();
+    let (done, returned) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for (_, routine, context) in routines {
+            routine(1, context as *mut c_void);
+        }
+        let _ = done.send(());
+    });
+    returned.recv_timeout(deadline).is_ok()
+        || returned
+            .recv_timeout(longer().saturating_sub(start.elapsed()))
+            .is_ok()
+}
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
@@ -201,31 +253,39 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let suspend = routines().clone();
-    tracing::info!(routines = suspend.len(), "{why}: suspending the title");
-    // Whoever comes first (the routines or the deadline) runs `then`; the
-    // other waits for it, so the process never ends halfway through.
-    let then = std::sync::Arc::new(Mutex::new(Some(then)));
-    let finish = move |how: &str| {
-        let mut then = then.lock().unwrap_or_else(|e| e.into_inner());
-        tracing::info!("{how}; ending the title");
-        if let Some(then) = then.take() {
-            then();
+    let routines = routines().clone();
+    tracing::info!(routines = routines.len(), "{why}: suspending the title");
+    let fixed = std::env::var("VICTORY_SUSPEND_MS")
+        .ok()
+        .and_then(|ms| asked(&ms));
+    // The one thread that waits also runs `then` and ends the process, so
+    // neither happens twice or halfway through.
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let before = victory_gpu::queue::presented();
+        let longer = || {
+            fixed.unwrap_or_else(|| {
+                let frames = victory_gpu::queue::presented() - before;
+                let time = stretched(SUSPEND_DEADLINE, frames);
+                tracing::info!(
+                    frames,
+                    ms = time.as_millis(),
+                    "title still suspending at the console's deadline (frames presented since, time it gets in all)"
+                );
+                time
+            })
+        };
+        let suspended = suspend(routines, fixed.unwrap_or(SUSPEND_DEADLINE), longer);
+        let ms = start.elapsed().as_millis();
+        if suspended {
+            tracing::info!("title suspended in {ms} ms; ending the title");
+        } else {
+            tracing::warn!(
+                "title did not finish suspending, timed out after {ms} ms; ending the title"
+            );
         }
+        then();
         end();
-    };
-    let late = finish.clone();
-    // Not on the calling thread: titles hand the suspend to their window
-    // thread and wait for it inside the routine.
-    std::thread::spawn(move || {
-        for (_, routine, context) in suspend {
-            routine(1, context as *mut c_void);
-        }
-        finish("title suspended");
-    });
-    std::thread::spawn(move || {
-        std::thread::sleep(SUSPEND_DEADLINE);
-        late("title did not finish suspending in time");
     });
 }
 
@@ -314,6 +374,85 @@ mod tests {
     use super::*;
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
+
+    /// A suspend routine that returns once its context, a flag, is set.
+    extern "system" fn held(_: u8, flag: *mut c_void) {
+        // SAFETY: the tests pass a static flag.
+        let flag = unsafe { &*(flag as *const AtomicBool) };
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn held_by(flag: &'static AtomicBool) -> (usize, Routine, usize) {
+        (0, held, flag as *const AtomicBool as usize)
+    }
+
+    #[test]
+    fn routines_that_return_end_the_suspend_at_once() {
+        static GO: AtomicBool = AtomicBool::new(true);
+        let start = Instant::now();
+        let minute = Duration::from_secs(60);
+        let routines = vec![held_by(&GO), (0, noop, 0)];
+        assert!(suspend(routines, minute, || unreachable!()));
+        assert!(start.elapsed() < minute / 2);
+    }
+
+    #[test]
+    fn routines_still_running_at_the_deadline_get_the_longer_time() {
+        static GO: AtomicBool = AtomicBool::new(false);
+        // They return only after the deadline, once the longer time is asked.
+        let longer = || {
+            GO.store(true, Ordering::SeqCst);
+            Duration::from_secs(60)
+        };
+        assert!(suspend(
+            vec![held_by(&GO)],
+            Duration::from_millis(20),
+            longer
+        ));
+    }
+
+    #[test]
+    fn routines_that_never_return_are_given_up_on() {
+        static GO: AtomicBool = AtomicBool::new(false);
+        let start = Instant::now();
+        let longer = || Duration::from_millis(60);
+        assert!(!suspend(
+            vec![held_by(&GO)],
+            Duration::from_millis(20),
+            longer
+        ));
+        assert!(start.elapsed() >= Duration::from_millis(60));
+        // No longer time than the deadline: given up on at the deadline.
+        let start = Instant::now();
+        let deadline = Duration::from_millis(20);
+        assert!(!suspend(vec![held_by(&GO)], deadline, || deadline));
+        assert!(start.elapsed() >= deadline);
+        GO.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_slow_title_gets_the_time_for_the_frames_of_a_console_second() {
+        let second = Duration::from_secs(1);
+        // 30 frames at 2 and at 3 a second; at one a second, the longest.
+        assert_eq!(stretched(second, 2), Duration::from_secs(15));
+        assert_eq!(stretched(second, 3), Duration::from_secs(10));
+        assert_eq!(stretched(second, 1), Duration::from_secs(30));
+        // As fast as the console, or stuck: the console's second.
+        for frames in [0, 30, 31, 600, u64::MAX] {
+            assert_eq!(stretched(second, frames), second);
+        }
+    }
+
+    #[test]
+    fn the_time_to_suspend_can_be_set() {
+        assert_eq!(asked("5000"), Some(Duration::from_secs(5)));
+        assert_eq!(asked(" 250 "), Some(Duration::from_millis(250)));
+        assert_eq!(asked("0"), Some(Duration::ZERO));
+        assert_eq!(asked("soon"), None);
+        assert_eq!(asked("-1"), None);
+    }
 
     #[test]
     fn registrations_come_and_go() {

@@ -948,7 +948,8 @@ pub(crate) fn frame_count() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-pub(crate) fn presented() -> u64 {
+/// How many frames the title has presented.
+pub fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
