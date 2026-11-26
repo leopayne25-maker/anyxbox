@@ -80,12 +80,25 @@ Sur PC, chaque fonction `X*` de la bibliothèque statique du GDK (`xgameruntime.
 | Interface | Fonctions | Servie par |
 |---|---|---|
 | `XStore` (+ 3 versions d'interface) | 70 | **AnyXboxX** (licence locale, produits vides, achat et téléchargement hors ligne) |
-| `XGameUi` | 42 | Windows |
-| `XUser` (+ 4 versions d'interface, `XUserGetGamertag`) | 44 | **AnyXboxX** (profil hors ligne) |
-| `XGameStreaming` | 32 | Windows |
+| `XGameUi` | 42 | **AnyXboxX** (sans interface système : les fenêtres passent par les rappels d'écran du jeu, `E_NOTIMPL` sans eux) |
+| `XUser` (+ 4 versions d'interface, `XUserGetGamertag`, périphériques) | 52 | **AnyXboxX** (profil hors ligne, périphériques audio de communication du PC) |
+| `XGameStreaming` | 32 | **AnyXboxX** (aucun client de streaming : les questions sur un client répondent `E_GAMESTREAMING_CLIENT_NOT_CONNECTED`) |
 | `XPackage` | 31 | Windows |
 | `XGameSave` (+ `XGameSaveFiles`) | 30 | **AnyXboxX** (disque du PC) |
 | `XTaskQueue` / `XAsync` / `XThread` | 27 | **AnyXboxX** |
+
+
+### Abonnements aux changements : non implémentés
+
+AnyXboxX ne suit pas le changement que signalent ces trois abonnements : il ne pourrait jamais appeler leur rappel. Selon la règle 3 (pas de faux succès), l'inscription renvoie `E_NOTIMPL` et est journalisée par la trace (`ANYXBOXX_TRACE=1`), aucun jeton n'est écrit, et la désinscription rend `false` (rien ne peut être inscrit). La requête correspondante rend toujours la valeur courante : un titre qui la relit voit le changement.
+
+| Abonnement (`E_NOTIMPL`) | Changement non suivi | Valeur courante |
+|---|---|---|
+| `XNetworkingRegisterConnectivityHintChanged` | connectivité réseau du PC | `XNetworkingGetConnectivityHint` |
+| `XUserRegisterForDeviceAssociationChanged` | association manette-joueur (non modélisée) | aucune : `XUserFindControllerForUserWithUiAsync` rend l'identifiant nul documenté pour PC |
+| `XUserRegisterForDefaultAudioEndpointUtf16Changed` | périphérique audio de communication par défaut de Windows | `XUserGetDefaultAudioEndpointUtf16` |
+
+Un titre qui traite une inscription refusée comme fatale s'arrête ici, et la trace montre l'appel refusé (`E_NOTIMPL`). Décision du mainteneur sur #156 (pas d'exception à la règle 3).
 
 ## Identité Xbox Series X
 

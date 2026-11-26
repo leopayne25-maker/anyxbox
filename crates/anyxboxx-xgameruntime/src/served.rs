@@ -92,6 +92,10 @@ fn object_for(name: &str, pairs: &[(Guid, Guid)], gdk: &[tables::GdkApi]) -> *co
         "PackageInterface" => crate::package::methods(),
         "HdrDisplayInterface" => crate::hdr_display::methods(),
         "NetworkingInterface" => crate::networking::methods(),
+        "StreamingInterface" => crate::streaming::methods(),
+        "GameUiInterface" => crate::gameui::methods(),
+        "AccessibilityInterface" => crate::accessibility::methods(),
+        "UserDeviceInterface" => crate::user_device::methods(),
         _ => Vec::new(),
     };
     let object: &'static Object = object::build(slots, query_interface as *const c_void, &methods);

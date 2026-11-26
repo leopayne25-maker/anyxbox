@@ -375,6 +375,7 @@ bool LocalUserId(const void* user, uint64_t* xuid) {
   *xuid = kXuid;
   return true;
 }
+bool IsLocalUserLocalId(uint64_t local_id) { return local_id == kLocalId; }
 void* GamertagInterface() { return const_cast<StaticInterface*>(&kGamertag); }
 
 }  // namespace anyxboxx

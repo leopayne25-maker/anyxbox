@@ -80,12 +80,24 @@ On PC, each `X*` function of the GDK static library (`xgameruntime.lib`) calls `
 | Interface | Functions | Served by |
 |---|---|---|
 | `XStore` (+ 3 interface versions) | 70 | **AnyXboxX** (local license, empty products, offline purchase and download) |
-| `XGameUi` | 42 | Windows |
-| `XUser` (+ 4 interface versions, `XUserGetGamertag`) | 44 | **AnyXboxX** (offline profile) |
-| `XGameStreaming` | 32 | Windows |
+| `XGameUi` | 42 | **AnyXboxX** (no system UI: dialogs go to the game's own UI callbacks, `E_NOTIMPL` without them) |
+| `XUser` (+ 4 interface versions, `XUserGetGamertag`, devices) | 52 | **AnyXboxX** (offline profile, PC communications audio devices) |
+| `XGameStreaming` | 32 | **AnyXboxX** (no streaming client: client queries answer `E_GAMESTREAMING_CLIENT_NOT_CONNECTED`) |
 | `XPackage` | 31 | Windows |
 | `XGameSave` (+ `XGameSaveFiles`) | 30 | **AnyXboxX** (PC disk) |
 | `XTaskQueue` / `XAsync` / `XThread` | 27 | **AnyXboxX** |
+
+### Change subscriptions: not implemented
+
+AnyXboxX does not track the change these three subscriptions report, so it could never call their callback. Following rule 3 (no fake success), registering returns `E_NOTIMPL` and is logged with the trace (`ANYXBOXX_TRACE=1`), no token is written, and unregistering returns `false` (nothing can be registered). The matching query always returns the current value, so a title that queries again sees the change.
+
+| Subscription (`E_NOTIMPL`) | Change not tracked | Current value |
+|---|---|---|
+| `XNetworkingRegisterConnectivityHintChanged` | network connectivity of the PC | `XNetworkingGetConnectivityHint` |
+| `XUserRegisterForDeviceAssociationChanged` | controller-to-player association (not modelled) | none: `XUserFindControllerForUserWithUiAsync` gives the all-zero device id documented for PC |
+| `XUserRegisterForDefaultAudioEndpointUtf16Changed` | Windows' default communications audio device | `XUserGetDefaultAudioEndpointUtf16` |
+
+A title that treats a failed registration as fatal stops here, and the trace shows the refused call (`E_NOTIMPL`). Maintainer's decision on #156 (no exception to rule 3).
 
 ## Xbox Series X identity
 

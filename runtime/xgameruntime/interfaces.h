@@ -27,6 +27,12 @@ void* DisplayInterface();
 // XUID du profil local si `user` est un handle XUser valide d'AnyXboxX.
 bool LocalUserId(const void* user, uint64_t* xuid);
 
+// Vrai si `local_id` est le XUserLocalId du profil local.
+bool IsLocalUserLocalId(uint64_t local_id);
+
+// XUser et périphériques : audio de Windows, manette sur PC (user_device_interface.cpp).
+void* UserDeviceInterface();
+
 // Sauvegardes (save_interface.cpp) et stockage local persistant (local_storage_interface.cpp).
 void* GameSaveInterface();
 void* LocalStorageInterface();
@@ -52,6 +58,15 @@ void* NetworkingInterface();
 
 // XStore : Microsoft Store hors ligne (store_interface.cpp) : licence locale, produits vides.
 void* StoreInterface();
+
+// XGameStreaming : jeu local, aucun client de streaming connecté (streaming_interface.cpp).
+void* StreamingInterface();
+
+// XGameUi : écrans confiés aux rappels du jeu, sans interface système (gameui_interface.cpp).
+void* GameUiInterface();
+
+// XAccessibility : contraste élevé réel de Windows (accessibility_interface.cpp).
+void* AccessibilityInterface();
 
 // Renvoie l'objet qui sert (fournisseur, interface), ou nullptr.
 void* ServedInterface(const GUID& provider, const GUID& iid);

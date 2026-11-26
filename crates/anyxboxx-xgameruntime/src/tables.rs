@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn served_table_matches_the_cpp_list() {
         let served = served();
-        assert_eq!(served.len(), 26);
+        assert_eq!(served.len(), 30);
         let task_queue = served
             .iter()
             .find(|e| e.object == "TaskQueueInterface")

@@ -53,7 +53,7 @@ Régénérer : `scarlett.py --carte <dossier du paquet> docs/images/carte-avance
 - **Instructions CPU : 100 %.** La Series X utilise un AMD Zen 2 en x86-64, le même jeu d'instructions qu'un PC : le code du jeu tourne tel quel.
 - **Instructions GPU : 89 %.** 1 330 des 1 490 encodages RDNA 2 tournent dans l'interpréteur de référence, et le recompilateur RDNA 2 → DXIL dessine déjà un premier shader de sommet et de pixel avec D3D12.
 - **Fonctions système : 66 %** des 1 337 fonctions importées par les DLL du paquet de test sont résolues.
-- **Runtime GDK : 210 fonctions sur 396** sont écrites dans AnyXboxX, en Rust et en C++ : la file de tâches, l'utilisateur hors ligne, l'identité de la Series X, les sauvegardes, le paquet, le Store hors ligne et les invitations. Les autres interfaces sont servies par le runtime GDK de Windows s'il est installé.
+- **Runtime GDK : 277 fonctions sur 396** sont écrites dans AnyXboxX, en Rust et en C++ : la file de tâches, l'utilisateur hors ligne et les périphériques audio de communication du PC, l'identité de la Series X, les sauvegardes, le paquet, le Store hors ligne, les invitations, le streaming de jeu sans client de streaming, les fenêtres système passées à l'interface du jeu, et les réglages réseau et le mode contraste élevé du PC. Les autres interfaces sont servies par le runtime GDK de Windows s'il est installé.
 
 Le graphique est régénéré par `scarlett.py --traduction <dossier du paquet> docs/images/traduction.svg`.
 
@@ -67,7 +67,7 @@ Le graphique est régénéré par `scarlett.py --traduction <dossier du paquet> 
 | Éclairage en ray tracing (le constructeur de structures BVH est coupé) | ⏳ à faire |
 | Interrupteur NVIDIA Smooth Motion dans le lanceur, préréglages pour les cartes de 8 et 12 Go | ✅ fait |
 | DLL du runtime en Rust : `xmem`, `kernelx`, `d3d12_xs`, `anyxboxx_tls`, `XCRDAPI` ; `xgameruntime` porté et vérifié contre la DLL C++, qui reste celle livrée | 🟡 en cours |
-| Runtime GDK : 210 fonctions sur 396 écrites dans AnyXboxX ; les autres déléguées au runtime GDK de Windows, nommées par la trace | 🟡 en cours |
+| Runtime GDK : 277 fonctions sur 396 écrites dans AnyXboxX ; les autres déléguées au runtime GDK de Windows, nommées par la trace | 🟡 en cours |
 | `XTaskQueue`, `XAsync`, `XThread`, `XUser`, `XSystem`, `XGameSave`, `XPackage`, `XStore` écrits par AnyXboxX | ✅ fait |
 | D3D12.X : `D3D12XboxCreateDevice`, interfaces `ID3D12*` de la console, servies par le `d3d12_xs.dll` en Rust de TomBox (MIT) | 🟡 en cours |
 | Désassembleur RDNA 2 : 1 490 mnémoniques, vérifié contre 38 999 encodages LLVM publics | 🟡 en cours |

@@ -120,11 +120,52 @@ HRESULT XNetworkingGetConnectivityHint(ConnectivityHint* hint) noexcept {
   return S_OK;
 }
 
-// Les changements de connectivité ne sont pas suivis : l'abonnement reçoit un jeton, sans rappel.
-HRESULT RegisterHintChanged(void*, void*, void* callback, void* token) noexcept {
-  return anyxboxx::AddSubscription(callback, token);
+// XNetworkingRegisterConnectivityHintChanged : E_NOTIMPL, journalisé (règle 3) : les changements de
+// connectivité ne sont pas suivis, le rappel ne serait jamais appelé ; XNetworkingGetConnectivityHint
+// rend l'état courant à chaque appel (docs/progress.md, « Change subscriptions »). Aucune inscription ne
+// peut réussir : le désabonnement n'a rien à retirer.
+bool UnregisterHintChanged(uint64_t, bool) noexcept { return false; }
+
+// --- XNetworking : réglages et statistiques des tampons TCP de réception ---------------
+// Ces tampons n'existent que sur console. Microsoft Learn documente la réponse du PC, qui est
+// celle du réseau réel ici : lecture à 0, modification en E_NOTIMPL, statistiques toutes à 0
+// (pages citées à côté de chaque fonction). Un réglage ou un type inconnu donne E_INVALIDARG
+// (.../functions/xnetworkingqueryconfigurationsetting, xnetworkingquerystatistics).
+constexpr uint32_t kTcpBufferKinds = 3;  // Title, System, Tools
+
+struct TcpQueuedReceiveStatistics {  // XNetworkingTcpQueuedReceivedBufferUsageStatistics
+  uint64_t bytes_currently_queued;
+  uint64_t peak_bytes_ever_queued;
+  uint64_t total_bytes_queued;
+  uint64_t bytes_dropped_for_exceeding_max;
+  uint64_t bytes_dropped_for_any_failure;
+};
+
+// The 0 is Microsoft Learn's answer for the PC, for each of the three settings: "Retrieving this setting on PC
+// will always report the value 0." ("this value" for MaxToolsTcpQueuedReceiveBufferSize; XNetworkingConfigurationSetting,
+// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/networking/xnetworking/enums/xnetworkingconfigurationsetting)
+HRESULT XNetworkingQueryConfigurationSetting(uint32_t setting, uint64_t* value) noexcept {
+  if (setting >= kTcpBufferKinds || value == nullptr) return E_INVALIDARG;
+  *value = 0;
+  return S_OK;
 }
-bool UnregisterHintChanged(uint64_t token, bool) noexcept { return anyxboxx::RemoveSubscription(token); }
+
+HRESULT XNetworkingSetConfigurationSetting(uint32_t setting, uint64_t value) noexcept {
+  if (setting >= kTcpBufferKinds) return E_INVALIDARG;
+  ANYXBOXX_TRACE("[runtime] XNetworkingSetConfigurationSetting(%u, %llu) : non réglable sur PC -> E_NOTIMPL",
+                 setting, static_cast<unsigned long long>(value));
+  return E_NOTIMPL;
+}
+
+// Seule la sous-structure du type demandé est écrite (structs/xnetworkingstatisticsbuffer).
+// All zero is Microsoft Learn's answer for the PC, for each of the three types: "On PC, all statistics in the
+// structure are always reported as 0." (XNetworkingStatisticsType,
+// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/networking/xnetworking/enums/xnetworkingstatisticstype)
+HRESULT XNetworkingQueryStatistics(uint32_t type, TcpQueuedReceiveStatistics* statistics) noexcept {
+  if (type >= kTcpBufferKinds || statistics == nullptr) return E_INVALIDARG;
+  *statistics = TcpQueuedReceiveStatistics{};
+  return S_OK;
+}
 
 void* const kHdrMethods[] = {
     ANYXBOXX_IUNKNOWN_METHODS,                  // 0-2
@@ -132,7 +173,9 @@ void* const kHdrMethods[] = {
     ANYXBOXX_METHOD(XDisplayTryEnableHdrMode),  // 4
 };
 
-// XNetworking : méthodes 3 à 20 (gdk_api_table.inc) ; seules 15 à 17 sont écrites.
+// XNetworking : méthodes 3 à 20 (gdk_api_table.inc) ; 15 à 20 sont écrites. Le port UDP
+// préféré n'est pas inventé (le GDK le dit ouvert dans le routeur par UPnP), et les
+// informations de sécurité d'URL viennent du portail Xbox Live : non écrits.
 void* const kNetworkingMethods[] = {
     ANYXBOXX_IUNKNOWN_METHODS,  // 0-2
     ANYXBOXX_NOT_IMPLEMENTED,  // 3 XNetworkingQueryPreferredLocalUdpMultiplayerPort
@@ -148,11 +191,11 @@ void* const kNetworkingMethods[] = {
     ANYXBOXX_NOT_IMPLEMENTED,  // 13 XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult
     ANYXBOXX_NOT_IMPLEMENTED,  // 14 XNetworkingVerifyServerCertificate
     ANYXBOXX_METHOD(XNetworkingGetConnectivityHint),  // 15
-    ANYXBOXX_METHOD(RegisterHintChanged),  // 16 XNetworkingRegisterConnectivityHintChanged
+    ANYXBOXX_NOT_IMPLEMENTED,  // 16 XNetworkingRegisterConnectivityHintChanged
     ANYXBOXX_METHOD(UnregisterHintChanged),  // 17 XNetworkingUnregisterConnectivityHintChanged
-    ANYXBOXX_NOT_IMPLEMENTED,  // 18 XNetworkingQueryConfigurationSetting
-    ANYXBOXX_NOT_IMPLEMENTED,  // 19 XNetworkingSetConfigurationSetting
-    ANYXBOXX_NOT_IMPLEMENTED,  // 20 XNetworkingQueryStatistics
+    ANYXBOXX_METHOD(XNetworkingQueryConfigurationSetting),  // 18
+    ANYXBOXX_METHOD(XNetworkingSetConfigurationSetting),  // 19 (E_NOTIMPL documenté sur PC)
+    ANYXBOXX_METHOD(XNetworkingQueryStatistics),  // 20
 };
 
 const anyxboxx::StaticInterface kHdr{kHdrMethods};
