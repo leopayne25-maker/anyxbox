@@ -226,7 +226,7 @@ def test_warm_runs_the_game_archives_only_before_the_game(tmp_path, fake_tool, b
 
 def test_warm_needs_an_archive(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--warm"], archives=())
-    assert calls == [BUILD] and done.returncode == 1
+    assert calls == [] and done.returncode == 1
     assert "no .rpf archive" in done.stderr
 
 
@@ -240,7 +240,20 @@ def test_precompile_warms_the_shader_archive_and_binaries_with_the_game_environm
 
 def test_precompile_needs_the_shader_archive(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--precompile"])
-    assert calls == [BUILD] and done.returncode == 1
+    assert calls == [] and done.returncode == 1
+    assert "shaders.rpf" in done.stderr
+
+
+def test_warm_and_precompile_share_one_call_without_duplicate_archives(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--warm", "--precompile"], precompile_inputs=True)
+    warm = WARM_PRECOMPILE.replace("victory shaders ", f"victory shaders {GAME_ARCHIVES} ", 1)
+    assert calls == [BUILD, warm + default_env(), GAME + default_env()], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
+def test_warm_and_precompile_validate_before_starting_either(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--warm", "--precompile"])
+    assert calls == [] and done.returncode == 1
     assert "shaders.rpf" in done.stderr
 
 
