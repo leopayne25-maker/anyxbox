@@ -406,9 +406,10 @@ struct Lane {
     clock: u64,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
-    /// Submitted, by sequence number: reads not started, status entries
-    /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    /// Submitted, by sequence number: reads not started (with their
+    /// enqueue-time page-array snapshot, if any), status entries not written,
+    /// reads running, and failures not yet reported.
+    reads: VecDeque<(u64, Request, Option<Vec<usize>>)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -425,6 +426,7 @@ struct Job {
     lane: u64,
     seq: u64,
     request: Request,
+    enqueued_pages: Option<Vec<usize>>,
     staging: u64,
 }
 
@@ -530,13 +532,13 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, job.enqueued_pages.take());
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
@@ -604,14 +606,15 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
+        let (seq, request, _) = lane.reads.front()?;
+        let (seq, request) = (*seq, *request);
         let staging = staging_bytes(&request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (_, _, enqueued_pages) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -623,6 +626,7 @@ impl Lanes {
             lane: id,
             seq,
             request,
+            enqueued_pages,
             staging,
         })
     }
@@ -662,7 +666,9 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request, enqueued_pages) => {
+                    lane.reads.push_back((seq, request, enqueued_pages))
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -783,7 +789,7 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 const PAGE: usize = 64 * 1024;
 
 enum Command {
-    Read(Request),
+    Read(Request, Option<Vec<usize>>),
     Status(Status),
 }
 
@@ -812,8 +818,8 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    as_enqueued(&request);
-    queue(this, Command::Read(request));
+    let enqueued_pages = as_enqueued(&request);
+    queue(this, Command::Read(request, enqueued_pages));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -884,7 +890,7 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, enqueued_pages: Option<Vec<usize>>) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -922,7 +928,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         // world's first frame). It is read beside and copied in: our copy
         // faults into the guard like the title's own writes.
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
-        return into_destination(request, size, |out| {
+        return into_destination(request, enqueued_pages, size, |out| {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
@@ -944,7 +950,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
+    into_destination(request, enqueued_pages, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -1118,6 +1124,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// allocation, and otherwise go through a buffer.
 fn into_destination(
     request: &Request,
+    enqueued_pages: Option<Vec<usize>>,
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
@@ -1140,7 +1147,7 @@ fn into_destination(
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
+    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE), enqueued_pages)[..];
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
@@ -1216,10 +1223,6 @@ fn into_destination(
     }
 }
 
-/// (Neptune) What the page arrays of the requests not yet run held when they were enqueued,
-/// by the array's address, in the order of the requests ([`as_enqueued`]).
-static ENQUEUED: Mutex<Option<HashMap<usize, VecDeque<Vec<usize>>>>> = Mutex::new(None);
-
 /// (Neptune) What each page array held when a request last ran with it, by the array's
 /// address: an array that holds that still at the next request's enqueue has not been
 /// touched since, and only such a one is waited for ([`filled`]). An array the title filled
@@ -1257,7 +1260,8 @@ fn same_runs(array: usize, set: Option<u32>) -> u32 {
 /// waited for it; and the microseconds waited in all.
 static STALE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// (Neptune) Notes what the page array of `request` holds as it is enqueued.
+/// (Neptune) Snapshots what the page array of `request` holds as it is enqueued, to carry
+/// with the queued request itself.
 ///
 /// The title fills the array after it has enqueued the request. Until it has, the array
 /// holds zeros, which [`filled`] waits for, or the numbers of its last use, which nothing
@@ -1266,18 +1270,18 @@ static STALE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// held (a texture of coloured noise on one character's arms, another's face). The faster
 /// the workers reach a request the more often: with a handle of their own for each read
 /// they found the array still zero 16 times in a launch, from none to two before.
+/// Carrying the snapshot on the request avoids leaking or desynchronizing snapshots when
+/// a queue closes or a request fails before writing its destination.
 /// `VICTORY_DSTORAGE_STALE_MS=0`: not noted, as before.
-fn as_enqueued(request: &Request) {
+fn as_enqueued(request: &Request) -> Option<Vec<usize>> {
     if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() || stale_wait().is_zero() {
-        return;
+        return None;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let n = (offset + request.destination_size as usize).div_ceil(PAGE);
     let array = request.destination.cast::<usize>();
     // SAFETY: the title passes a page number per 64 KiB of destination.
-    let now: Vec<usize> = (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect();
-    let mut all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
-    all.get_or_insert_with(HashMap::new).entry(array as usize).or_default().push_back(now);
+    Some((0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect())
 }
 
 /// How long a request waits for a page array that still holds what it held at enqueue
@@ -1296,7 +1300,7 @@ fn stale_wait() -> std::time::Duration {
 /// enqueued the request (a copy taken then holds zeros, or the numbers of
 /// the array's last use), so it is read when the request runs; a number
 /// that is still zero then is waited for, a tenth of a second at most.
-fn filled(array: *const usize, n: usize) -> Vec<usize> {
+fn filled(array: *const usize, n: usize, before: Option<Vec<usize>>) -> Vec<usize> {
     static LATE: AtomicU64 = AtomicU64::new(0);
     let read = || -> Vec<usize> {
         // SAFETY: the title passes a page number per 64 KiB of destination
@@ -1308,18 +1312,6 @@ fn filled(array: *const usize, n: usize) -> Vec<usize> {
     // (Neptune) What the array held when this request was enqueued ([`as_enqueued`]): while
     // it holds that still, and that is not zeros, the title has not filled it for this
     // request yet (or asks for the same pages again, which a short wait does not harm).
-    let before = {
-        let mut all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
-        let found = all.as_mut().and_then(|all| {
-            let line = all.get_mut(&(array as usize))?;
-            let before = line.pop_front();
-            if line.is_empty() {
-                all.remove(&(array as usize));
-            }
-            before
-        });
-        found
-    };
     let untouched = {
         let last = LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
         last.as_ref()
@@ -1544,11 +1536,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
             array[1].store(8, Ordering::Release);
         });
-        assert_eq!(filled(array.as_ptr().cast(), 2), [7, 8]);
+        assert_eq!(filled(array.as_ptr().cast(), 2, None), [7, 8]);
         title.join().unwrap();
         // One never filled is given up on.
         array[0].store(0, Ordering::Release);
-        assert_eq!(filled(array.as_ptr().cast(), 2), [0, 8]);
+        assert_eq!(filled(array.as_ptr().cast(), 2, None), [0, 8]);
     }
 
     #[test]
@@ -1700,7 +1692,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(r, None));
     }
 
     #[test]
@@ -2024,5 +2016,101 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    /// A `PAGE_DESTINATION` request dropped by closing a queue or failing before
+    /// `into_destination` must not leak an enqueue-time snapshot or desynchronize
+    /// stale-array detection for later requests reusing the same page-array address.
+    #[test]
+    fn failed_or_closed_page_requests_do_not_desync_late_page_array_wait() {
+        use std::sync::atomic::AtomicUsize;
+        use crate::modules::xmem;
+
+        let allocate = |n: usize| {
+            let (mut pages, mut given) = (vec![0usize; n], n);
+            assert_eq!(
+                xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
+                1
+            );
+            pages
+        };
+        let pages_a = allocate(1);
+        let pages_b = allocate(1);
+        let pages_c = allocate(1);
+        let payload = pattern(128);
+        let (_dir, file) = file_with(&payload);
+
+        // One reused page-array slot (heap-allocated so a background thread can fill it
+        // asynchronously after enqueue, as the title does).
+        let array: &'static [AtomicUsize] = Box::leak(Box::new([AtomicUsize::new(pages_a[0])]));
+        let array_ptr = array.as_ptr() as *mut c_void;
+
+        // 0. Baseline successful request into `pages_a` establishes `LAST_RUN[array] = [pages_a]`.
+        let q = new_queue(0);
+        let status = status_array(3);
+        enqueue(q, &request(PAGE_DESTINATION, array_ptr, 32, file, 0, 32));
+        enqueue_status(q, status, 0);
+        void(q, 0x30);
+        assert_eq!(wait(status, 0), S_OK);
+
+        // 1. A request enqueued while the array holds `pages_b` on a queue closed before submit.
+        array[0].store(pages_b[0], Ordering::Release);
+        let closed_q = new_queue(0);
+        enqueue(closed_q, &request(PAGE_DESTINATION, array_ptr, 32, file, 32, 32));
+        void(closed_q, 0x40); // close without submitting
+
+        // 2. A request enqueued while the array holds `pages_b` that fails before
+        //    `into_destination` (`END_OF_FILE` in `read_source`).
+        enqueue(q, &request(ZLIB | PAGE_DESTINATION, array_ptr, 32, file, 1024, 16));
+        enqueue_status(q, status, 1);
+        void(q, 0x30);
+        assert_eq!(wait(status, 1), END_OF_FILE);
+
+        // 3. The array still holds stale `pages_a` at enqueue time; the title writes the
+        //    real destination `pages_c` 3 ms after submit. With per-request snapshots, the
+        //    worker sees `before == pages == LAST_RUN` and waits for `pages_c`. With a
+        //    desynchronized global queue, it pops `pages_b != pages_a`, skips the wait,
+        //    and silently overwrites `pages_a` instead of `pages_c`!
+        array[0].store(pages_a[0], Ordering::Release);
+        enqueue(q, &request(PAGE_DESTINATION, array_ptr, 32, file, 64, 32));
+        enqueue_status(q, status, 2);
+        void(q, 0x30);
+        let page_c = pages_c[0];
+        let filler = std::thread::spawn(move || {
+            // Busy-wait 2 ms rather than `thread::sleep` (whose default Windows
+            // timer quantum is ~15.6 ms, longer than `stale_wait()`'s 10 ms).
+            let began = Instant::now();
+            while began.elapsed() < Duration::from_millis(2) {
+                std::thread::yield_now();
+            }
+            array[0].store(page_c, Ordering::Release);
+        });
+        assert_eq!(wait(status, 2), S_OK);
+        filler.join().unwrap();
+
+        let read_page = |page: usize| -> Vec<u8> {
+            let mapped = xmem::XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                0x2000 | 0x2040_0000,
+                0,
+                0x04,
+            );
+            assert!(!mapped.is_null());
+            assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, &page), mapped);
+            // SAFETY: mapped read-write page.
+            let bytes = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 32) }.to_vec();
+            assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, std::ptr::null()), mapped);
+            bytes
+        };
+        let seen_a = read_page(pages_a[0]);
+        let seen_c = read_page(pages_c[0]);
+        assert_eq!(xmem::XMemFreePhysicalPages(1, pages_a.as_ptr()), 1);
+        assert_eq!(xmem::XMemFreePhysicalPages(1, pages_b.as_ptr()), 1);
+        assert_eq!(xmem::XMemFreePhysicalPages(1, pages_c.as_ptr()), 1);
+        void(q, 0x40);
+
+        assert_eq!(seen_a, &payload[0..32], "stale page `pages_a` must not be overwritten");
+        assert_eq!(seen_c, &payload[64..96], "late-filled destination `pages_c` must receive the bytes");
     }
 }
