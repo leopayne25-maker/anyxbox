@@ -1620,6 +1620,9 @@ fn raw_twins() -> bool {
 /// heap of 1,507,328, past its end. Unclamped, that index is undefined on
 /// any host.
 pub(crate) fn probe_view_limit() {
+    if victory_shader::emit::view_heap_limit() != 0 {
+        return;
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
