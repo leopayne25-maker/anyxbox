@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::policy::ensure_outside_repo;
+use crate::policy::{ensure_outside_repo, resolve as resolve_path};
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
@@ -91,6 +91,13 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        if path_starts_with(&resolve_path(&data_dir)?, &resolve_path(&cache_dir)?) {
+            anyhow::bail!(
+                "data directory {} is at or inside the cache directory {}; set VICTORY_DATA_DIR or [paths].data_dir to a location outside the cache",
+                data_dir.display(),
+                cache_dir.display()
+            );
+        }
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
@@ -125,6 +132,43 @@ fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Opt
     env("VICTORY_CONFIG")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+#[cfg(windows)]
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    // Canonicalization preserves the caller's spelling for components that do not exist yet.
+    let mut path_parts = path.components();
+    root.components().all(|root_part| {
+        let Some(path_part) = path_parts.next() else {
+            return false;
+        };
+        let root_wide: Vec<_> = root_part.as_os_str().encode_wide().collect();
+        let path_wide: Vec<_> = path_part.as_os_str().encode_wide().collect();
+        let (Ok(root_len), Ok(path_len)) = (
+            i32::try_from(root_wide.len()),
+            i32::try_from(path_wide.len()),
+        ) else {
+            return false;
+        };
+        // SAFETY: Each UTF-16 buffer lives through the call and is passed with its exact length.
+        unsafe {
+            CompareStringOrdinal(
+                root_wide.as_ptr(),
+                root_len,
+                path_wide.as_ptr(),
+                path_len,
+                1,
+            ) == CSTR_EQUAL
+        }
+    })
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -212,6 +256,55 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn persistent_data_cannot_be_inside_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        for data in [cache.clone(), cache.join("saves")] {
+            let file = FilePaths {
+                cache_dir: Some(cache.clone()),
+                data_dir: Some(tmp.path().join("data")),
+                ..Default::default()
+            };
+            let env =
+                |key: &str| (key == "VICTORY_DATA_DIR").then(|| data.clone().into_os_string());
+            let err = Config::resolve(file, None, env).unwrap_err();
+            assert!(err.to_string().contains("cache directory"), "{err}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_data_cannot_use_a_case_alias_of_a_missing_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("CachÉ");
+        let data = tmp.path().join("caché").join("saves");
+        assert!(!cache.exists());
+        assert!(!data.exists());
+        let file = FilePaths {
+            cache_dir: Some(cache),
+            data_dir: Some(data),
+            ..Default::default()
+        };
+        let err = Config::resolve(file, None, |_| None).unwrap_err();
+        assert!(err.to_string().contains("cache directory"), "{err}");
+    }
+
+    #[test]
+    fn adjacent_data_and_cache_directories_are_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("cache-saves");
+        let file = FilePaths {
+            cache_dir: Some(tmp.path().join("cache")),
+            data_dir: Some(data.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            Config::resolve(file, None, |_| None).unwrap().data_dir,
+            data
+        );
     }
 
     #[test]
