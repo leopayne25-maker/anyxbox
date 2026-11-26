@@ -402,6 +402,112 @@ pub(crate) fn host_alias(at: usize, len: usize) -> Option<*mut u8> {
     (host != 0).then(|| (host + offset as usize + within) as *mut u8)
 }
 
+/// Classification of a 64 KiB title page under `VIEWS` for lazy copy-back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageViewInfo {
+    /// Page is not inside any registered `title_memory_view`.
+    Unknown,
+    /// Page is mapped into multiple title views (aliased physical frame).
+    Aliased,
+    /// Page is backed by a single registered title view: `(section, offset, section_bytes)`.
+    Single(usize, u64, u64),
+}
+
+/// Batch-classifies 64 KiB title addresses under ONE `VIEWS` lock.
+pub(crate) fn single_view_pages_batch(addrs: &[usize]) -> Vec<PageViewInfo> {
+    let v = views();
+    let mut out = Vec::with_capacity(addrs.len());
+    for &page_addr in addrs {
+        if !page_addr.is_multiple_of(K64) {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        }
+        let Some((&base, &(bytes, section, offset))) = v.views.range(..=page_addr).next_back() else {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        };
+        let within = page_addr.wrapping_sub(base);
+        if within >= bytes || within.saturating_add(K64) > bytes {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        }
+        let sec_off = offset + within as u64;
+        let Some(shown) = v.pages.get(&(section, sec_off)) else {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        };
+        if shown.len() != 1 {
+            out.push(PageViewInfo::Aliased);
+            continue;
+        }
+        let Some(sec_bytes) = v.sections.iter().find(|s| s.0 == section).map(|s| s.1) else {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        };
+        if sec_off.checked_add(K64 as u64).is_none_or(|e| e > sec_bytes) {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        }
+        out.push(PageViewInfo::Single(section, sec_off, sec_bytes));
+    }
+    out
+}
+
+/// Writes `bytes` into `section` at `offset` through our persistent writable
+/// whole-section mapping in [`ALIASES`], avoiding per-page `MapViewOfFile` /
+/// `UnmapViewOfFile` kernel transitions during lazy copy-back materialization.
+/// Leaf lock (`ALIASES` only; never acquires `VIEWS` or `LAZY_TABLE`).
+pub(crate) fn write_section_own(
+    section: usize,
+    section_bytes: u64,
+    offset: u64,
+    bytes: &[u8],
+) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let Some(end) = offset.checked_add(bytes.len() as u64) else {
+        return false;
+    };
+    if end > section_bytes {
+        return false;
+    }
+    let host = {
+        let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+        match aliases.iter().find(|a| a.0 == section) {
+            Some(&( _, base, size)) => (base != 0 && end <= size).then_some(base),
+            None => {
+                // SAFETY: live section handle passed by runtime (remapping flushes
+                // deferred pages before closing). Mapped whole for read/write.
+                let base = unsafe {
+                    mem::MapViewOfFile(
+                        section as _,
+                        mem::FILE_MAP_READ | mem::FILE_MAP_WRITE,
+                        0,
+                        0,
+                        0,
+                    )
+                }
+                .Value as usize;
+                aliases.push((section, base, section_bytes));
+                (base != 0).then_some(base)
+            }
+        }
+    };
+    let Some(base) = host else {
+        return false;
+    };
+    let Some(dst) = base.checked_add(offset as usize) else {
+        return false;
+    };
+    // SAFETY: `dst..dst+bytes.len()` lies within our persistent writable section
+    // view (`end <= section_bytes`) and does not overlap `bytes`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+    }
+    true
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
