@@ -1942,6 +1942,10 @@ pub(crate) fn copy_changed() -> bool {
 /// between them are the same on the CPU side and the card (nothing of the stretch is being written
 /// by shaders: `update` cut those ranges out), so sending them again changes nothing; what it saves
 /// is ranges (27,661 a frame for 51 MB in run main-neptune-2258).
+///
+/// Only for refreshes: the title's bytes put in under flights' shader writes
+/// ([`Shadow::merge_under_writes`]) lie in ranges shaders are writing, and the bytes between
+/// two such runs are the shaders' on the card, not the CPU side's.
 fn copy_coalesce_gap() -> usize {
     static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| std::env::var("VICTORY_COPY_COALESCE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
@@ -3808,8 +3812,12 @@ impl Shadow {
                     }
                     MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                     // (Neptune) One taking of the lock for the page's runs:
-                    // there are hundreds to a page.
-                    self.card_changed_runs(at, &runs);
+                    // there are hundreds to a page. Each run on its own,
+                    // whatever `VICTORY_COPY_COALESCE` says: the bytes between
+                    // them are the flights' shaders' on the card, and a range
+                    // joined across them would put the CPU side's older bytes
+                    // back over what the shaders wrote there.
+                    self.card_changed_runs(at, &runs, 0);
                 } else {
                     let Some(snapshot) = before.as_mut() else {
                         MERGED[6].fetch_add(1, Ordering::Relaxed);
@@ -4073,7 +4081,7 @@ impl Shadow {
                 }
                 if let (Some(first), Some(last)) = (runs.first(), runs.last()) {
                     self.changed(from - start + first.0, from - start + last.0 + last.1);
-                    self.card_changed_runs(from - start, &runs);
+                    self.card_changed_runs(from - start, &runs, copy_coalesce_gap());
                 }
             });
             return n;
@@ -4206,12 +4214,15 @@ impl Shadow {
     }
 
     /// (Neptune) [`Shadow::card_changed`] for `runs` (offset, bytes; in
-    /// order) of the stretch that begins at offset `at`.
-    fn card_changed_runs(&self, at: usize, runs: &[(usize, usize)]) {
+    /// order) of the stretch that begins at offset `at`, those at most `gap`
+    /// bytes apart sent up as one range ([`copy_coalesce_gap`]; 0: each on
+    /// its own). A gap is sent from the CPU's side too, so `gap` is 0 where
+    /// shaders may be writing between the runs ([`Shadow::merge_under_writes`]).
+    fn card_changed_runs(&self, at: usize, runs: &[(usize, usize)], gap: usize) {
         let Some(card) = &self.card else {
             return;
         };
-        let merged = coalesce_runs(runs, copy_coalesce_gap());
+        let merged = coalesce_runs(runs, gap);
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         for &(r, m) in &merged {
             let (from, to) = (at + r, at + r + m);
@@ -5425,6 +5436,56 @@ mod card_merge_tests {
         drop(b);
         assert!(card_dirty(5).0.is_empty());
         drop((a, c));
+    }
+
+    /// The title changes two words 96 bytes apart in a range a flight's
+    /// shaders are writing, of a copy in the card's memory: what goes up to
+    /// the card is those two words, each on its own, whatever
+    /// `VICTORY_COPY_COALESCE` says (the launcher sets 256). Joined, the 92
+    /// bytes between them would go up from the CPU side and put its older
+    /// bytes back over what the shaders wrote there.
+    #[test]
+    fn title_words_under_shader_writes_go_up_on_their_own() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        // SAFETY: a fresh private region, write-watched as title memory is.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!title.is_null());
+        // The CPU side holds what the title held when the range went to the shaders.
+        let mut side = vec![0u8; LEN];
+        let mut shadow = Shadow::new(buffer, side.as_mut_ptr(), 0, title as u64, LEN as u64);
+        shadow.card = Some(Card {
+            staging: Some(staging),
+            chunks: Mutex::default(),
+            prints: Mutex::default(),
+            flagged: std::sync::atomic::AtomicBool::new(false),
+            me: std::sync::OnceLock::new(),
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            // 0: no card bytes counted (`Drop` takes them off again).
+            size: 0,
+        });
+        // A flight's shaders may write the whole copy.
+        shadow.pending.lock().unwrap().push((title as usize, title as usize + LEN));
+        // SAFETY: inside the region.
+        unsafe {
+            title.add(100).cast::<u32>().write_unaligned(0x1111_1111);
+            title.add(200).cast::<u32>().write_unaligned(0x2222_2222);
+        }
+        let mut runs_left = 1000;
+        assert!(!shadow.merge_under_writes(title as usize, LEN, &mut runs_left), "the flights were to be settled");
+        let dirty = shadow.card.as_ref().unwrap().dirty.lock().unwrap().clone();
+        assert_eq!(dirty, vec![(100, 104), (200, 204)], "the bytes between the title's runs went up too");
+        assert_eq!(side[100..104], [0x11; 4]);
+        assert_eq!(side[150], 0);
+        drop(shadow);
+        // SAFETY: the region allocated above, no longer used.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
     }
 }
 
