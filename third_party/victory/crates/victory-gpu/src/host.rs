@@ -43,6 +43,8 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Atomic mirror of the highest value signalled on `fence`.
+    last_signalled: std::sync::atomic::AtomicU64,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -300,13 +302,23 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+pub(crate) fn submissions_in_flight() -> u64 {
+    STARTED
+        .load(Ordering::Acquire)
+        .saturating_sub(FINISHED.load(Ordering::Acquire))
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        if reaper_on() {
+            reap(vec![Retired(Box::new(object))]);
+        } else {
+            drop(object);
+        }
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -315,6 +327,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
 
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
+    let mut all_done = Vec::new();
     for list in &RETIRED {
         // Taken out under the lock, sorted through without it.
         let taken = {
@@ -328,8 +341,94 @@ fn bury(finished: u64) {
         if !keep.is_empty() {
             list.lock().unwrap_or_else(|e| e.into_inner()).extend(keep);
         }
-        drop(done);
+        all_done.extend(done.into_iter().map(|(_, object)| object));
     }
+    reap(all_done);
+}
+
+/// Whether retired host objects are dropped on a dedicated background thread
+/// (`VICTORY_REAPER=1`; `alt`: twenty seconds on, twenty off, alternating).
+/// Off by default.
+fn reaper_on() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_REAPER").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if asked == 0 || std::thread::Builder::new().name("victory-reaper".into()).spawn(reaper).is_err() {
+            return 0;
+        }
+        tracing::info!("host objects that are let go are dropped by a thread of their own (VICTORY_REAPER=1; alt: in turn)");
+        asked
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "host objects let go are dropped by their own thread from now (VICTORY_REAPER=alt): {}",
+                    if on { "ON" } else { "off, by the thread that lets them go as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Objects waiting for [`reaper`].
+static REAP: (Mutex<Vec<Retired>>, std::sync::Condvar) = (Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+/// Objects [`reaper`] dropped since the start, and the microseconds spent.
+static REAPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Drops `objects` synchronously, or hands them to [`reaper`] when [`reaper_on`].
+fn reap(objects: Vec<Retired>) {
+    if objects.is_empty() {
+        return;
+    }
+    if !reaper_on() {
+        drop(objects);
+        return;
+    }
+    REAP.0.lock().unwrap_or_else(|e| e.into_inner()).extend(objects);
+    REAP.1.notify_one();
+}
+
+/// Background thread that destroys retired D3D12 COM objects outside submission paths.
+fn reaper() {
+    loop {
+        let batch = {
+            let mut queue = REAP.0.lock().unwrap_or_else(|e| e.into_inner());
+            while queue.is_empty() {
+                queue = REAP.1.wait(queue).unwrap_or_else(|e| e.into_inner());
+            }
+            std::mem::take(&mut *queue)
+        };
+        let n = batch.len() as u64;
+        let started = std::time::Instant::now();
+        drop(batch);
+        REAPED[0].fetch_add(n, Ordering::Relaxed);
+        REAPED[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn flush_reaper_for_test() {
+    struct SyncDrop(std::sync::mpsc::SyncSender<()>);
+    impl Drop for SyncDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    reap(vec![Retired(Box::new(SyncDrop(tx)))]);
+    let _ = rx.recv();
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -759,6 +858,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            last_signalled: std::sync::atomic::AtomicU64::new(0),
             event,
             rtvs,
             rtv_size,
@@ -6302,6 +6402,7 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    self.last_signalled.store(*submitted, Ordering::Release);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -6805,7 +6906,13 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        if late && flying() && crate::resource::has_unclamped_rebinds() {
+            self.settle(&mut submitted, WHY_SYNC);
+        }
         let behind = late && flying();
+        if !behind {
+            crate::resource::evict_if_pressured();
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -6896,12 +7003,18 @@ impl Host {
         }
         let prepared = std::time::Instant::now();
         if late {
-            *submitted += 1;
+            let frame = crate::frame::current();
+            let next_fence = *submitted + 1;
+            for list in runs {
+                list.stamp_textures(frame, next_fence);
+            }
+            *submitted = next_fence;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            self.last_signalled.store(*submitted, Ordering::Release);
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6935,8 +7048,17 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        let frame = crate::frame::current();
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
+            let next_fence = *submitted + 1;
+            if groups.len() == runs.len() {
+                runs[i].stamp_textures(frame, next_fence);
+            } else {
+                for list in runs {
+                    list.stamp_textures(frame, next_fence);
+                }
+            }
+            *submitted = next_fence;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -6945,6 +7067,7 @@ impl Host {
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
+                    .map(|()| self.last_signalled.store(*submitted, Ordering::Release))
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
@@ -7400,6 +7523,14 @@ impl HostList {
                 }
                 (before != wanted).then_some((texture, before))
             }
+        }
+    }
+
+    /// Stamps `frame` and `fence` onto every host texture this list holds.
+    pub(crate) fn stamp_textures(&self, frame: u64, fence: u64) {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, _, copy) in states.values() {
+            copy.note_submitted(frame, fence);
         }
     }
 
@@ -8831,6 +8962,45 @@ impl Host {
     /// given memory ahead of the list that uploads them).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
         &self.queue
+    }
+
+    pub(crate) fn completed_fence(&self) -> u64 {
+        // SAFETY: a plain fence query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    pub(crate) fn last_signalled_fence(&self) -> u64 {
+        self.last_signalled.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fence(&self) -> &ID3D12Fence {
+        &self.fence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_submit_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_fenced_for_test(&self, list: &HostList, release_states: bool) -> u64 {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let next = *submitted + 1;
+        list.stamp_textures(crate::frame::current(), next);
+        if release_states {
+            list.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        *submitted = next;
+        let cmd: Option<ID3D12CommandList> = list.list.cast().ok();
+        // SAFETY: closed list and our fence, under `submitted`.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[cmd]);
+            self.queue.Signal(&self.fence, next).expect("signal host fence");
+        }
+        self.last_signalled.store(next, Ordering::Release);
+        next
     }
 
     /// A buffer in the upload heap, mapped for writing.

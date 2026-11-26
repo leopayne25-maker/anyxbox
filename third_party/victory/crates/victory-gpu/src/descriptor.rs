@@ -28,10 +28,10 @@ const HEAP_IIDS: [Iid; 4] = [
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapDesc {
-    kind: u32,
-    count: u32,
-    flags: u32,
-    nodes: u32,
+    pub(crate) kind: u32,
+    pub(crate) count: u32,
+    pub(crate) flags: u32,
+    pub(crate) nodes: u32,
 }
 
 /// Newer titles (the title) pass the description followed by
@@ -903,6 +903,73 @@ pub(crate) fn make_waiting() {
             }
         }
     }
+}
+
+/// Unmakes shader-visible title slots and clears untaken dynamic slots that
+/// retain any host resource pointer in `victims`, retiring all released COM
+/// references outside every lock and returning `(unmade_slots, shader_resources)`
+/// registered in [`WAITING`]. Call only under `Host::submitted` when no GPU
+/// submission is in flight.
+#[cfg(windows)]
+pub(crate) fn evict_kept_resources(
+    victims: &std::collections::HashSet<usize>,
+    frame: u64,
+    cooldown_frames: u64,
+) -> (usize, Vec<usize>) {
+    if victims.is_empty() {
+        return (0, Vec::new());
+    }
+    let mut removed = Vec::new();
+    let mut waits: Vec<(usize, u64)> = Vec::new();
+    let mut unmade = 0usize;
+    {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed under lock in `Drop`).
+            let heap = unsafe { &*(at as *const Heap) };
+            let Some(Some(host)) = heap.host.get() else {
+                continue;
+            };
+            let mut shader_slots = Vec::new();
+            unmade += host.evict_kept(
+                victims,
+                frame,
+                cooldown_frames,
+                &mut removed,
+                &mut shader_slots,
+            );
+            for (resource, index) in shader_slots {
+                if let Some(handle) = heap.handle(index) {
+                    waits.push((resource, handle));
+                }
+            }
+        }
+    }
+    let mut resources = Vec::new();
+    if !waits.is_empty() {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        for (resource, handle) in waits {
+            let slots = waiting.entry(resource).or_default();
+            if !slots.contains(&handle) {
+                slots.push(handle);
+            }
+            if !resources.contains(&resource) {
+                resources.push(resource);
+            }
+        }
+    }
+    if !removed.is_empty() {
+        if crate::host::submissions_in_flight() == 0 {
+            // Synchronous drop outside all locks decrements duplicate heap COM
+            // references immediately (even under `VICTORY_REAPER=1`) while
+            // `Hosted::made` still owns ref #1; Pass 2's `host::retire` then
+            // offloads final D3D12 resource destruction to the reaper.
+            drop(removed);
+        } else {
+            crate::host::retire(removed);
+        }
+    }
+    (unmade, resources)
 }
 
 fn record(handle: u64, view: View) {
