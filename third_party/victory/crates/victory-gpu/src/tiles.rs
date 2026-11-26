@@ -56,6 +56,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::host;
 
+#[cfg(test)]
+mod pool_tests;
+
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
 
@@ -131,17 +134,13 @@ pub(crate) fn given_total() -> u64 {
 struct Heap {
     heap: ID3D12Heap,
     free: Vec<(u32, u32)>,
+    /// Sum of the free runs, maintained under the pool's lock.
+    free_tiles: u32,
 }
 
 // SAFETY: a heap of the device, named only in queue and device calls, which
 // any thread may make; its free runs are plain numbers behind `POOL`'s lock.
 unsafe impl Send for Heap {}
-
-impl Heap {
-    fn free_tiles(&self) -> u32 {
-        self.free.iter().map(|run| run.1).sum()
-    }
-}
 
 /// The pool's heaps by place; a place is empty after its heap went back to
 /// the card (a texture names its heaps by place).
@@ -149,14 +148,28 @@ static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
-/// the heap, its place in the pool and the runs (first tile, tiles). A new
-/// heap is made when no heap has that many free.
+/// the heap, its place in the pool and the runs (first tile, tiles).
+/// Prefer the tightest fit so small levels leave room for larger ones.
+/// A new heap is made when no heap has that many free.
 fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
     if count == 0 || count > HEAP_TILES {
         return None;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
+    let mut found = None;
+    let mut best_free = HEAP_TILES + 1;
+    for (index, heap) in pool.iter().enumerate() {
+        let Some(heap) = heap else { continue };
+        let free = heap.free_tiles;
+        if free < count || free >= best_free {
+            continue;
+        }
+        found = Some(index);
+        best_free = free;
+        if free == count {
+            break;
+        }
+    }
     let index = match found {
         Some(index) => index,
         None => {
@@ -178,6 +191,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             let fresh = Heap {
                 heap: made?,
                 free: vec![(0, HEAP_TILES)],
+                free_tiles: HEAP_TILES,
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
@@ -206,6 +220,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         }
         left -= part;
     }
+    h.free_tiles -= count;
     Some((h.heap.clone(), index, runs))
 }
 
@@ -229,8 +244,8 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
         }
     }
     h.free = joined;
-    let all_free = h.free_tiles() == HEAP_TILES;
-    if all_free && pool.iter().flatten().count() > 1 {
+    h.free_tiles = h.free.iter().map(|run| run.1).sum();
+    if h.free_tiles == HEAP_TILES && pool.iter().flatten().count() > 1 {
         pool[index] = None;
         STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
         STATS[8].fetch_add(1, Ordering::Relaxed);
@@ -1101,7 +1116,7 @@ void look() {
         }
     }
 
-    fn sub(texture: &ID3D12Resource, index: u32) -> D3D12_TEXTURE_COPY_LOCATION {
+    pub(super) fn sub(texture: &ID3D12Resource, index: u32) -> D3D12_TEXTURE_COPY_LOCATION {
         D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -1110,7 +1125,7 @@ void look() {
         }
     }
 
-    fn placed(buffer: &ID3D12Resource, footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT) -> D3D12_TEXTURE_COPY_LOCATION {
+    pub(super) fn placed(buffer: &ID3D12Resource, footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT) -> D3D12_TEXTURE_COPY_LOCATION {
         D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
             pResource: unsafe { std::mem::transmute_copy(buffer) },
