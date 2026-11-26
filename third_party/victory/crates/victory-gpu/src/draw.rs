@@ -1199,10 +1199,13 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            // Bound again after an indirect clamp, the list holds it already.
+            if !list.holds_pipeline(self.host_pipeline) {
+                list.used_pipeline(&p.name);
+                list.keep(&p.pso);
+                list.keep(&p.root);
+            }
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -3588,7 +3591,7 @@ impl State {
             // alive, and the signature is cached.
             unsafe {
                 list.list.ExecuteIndirect(
-                    &signature,
+                    signature,
                     1,
                     &args.buffer,
                     args.offset(arguments),
@@ -3678,7 +3681,7 @@ impl State {
             // alive, and the signature is cached.
             unsafe {
                 list.list.ExecuteIndirect(
-                    &signature,
+                    signature,
                     max.max(1),
                     &args.buffer,
                     args.offset(arguments),
@@ -3719,7 +3722,7 @@ impl State {
                 }
                 // SAFETY: an open list with everything set; the list keeps its
                 // ahead buffers, and the signature is cached.
-                unsafe { list.list.ExecuteIndirect(&signature, 1, &slots, at, None::<&ID3D12Resource>, 0) };
+                unsafe { list.list.ExecuteIndirect(signature, 1, &slots, at, None::<&ID3D12Resource>, 0) };
                 if kind == MESH {
                     self.mesh_scissor(list, false);
                 }
@@ -3826,7 +3829,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -3844,12 +3846,12 @@ impl State {
                 for part in 0..crate::indirect::SPLIT {
                     list.list.SetComputeRoot32BitConstant(*param, part * crate::indirect::PART, *dword);
                     let at = u64::from(part) * crate::indirect::PART_BYTES;
-                    list.list.ExecuteIndirect(signature, 1, &bounded, at, None, 0);
+                    list.list.ExecuteIndirect(*signature, 1, &bounded, at, None, 0);
                 }
                 list.list.SetComputeRoot32BitConstant(*param, 0, *dword);
             } else {
                 list.list.ExecuteIndirect(
-                    &signature,
+                    signature,
                     max,
                     &bounded,
                     at,
@@ -3874,7 +3876,6 @@ impl State {
             let name = crate::pipeline::shaders_of(self.pipeline as This);
             crate::capture::read_indirect(list, crate::capture::Records::Clamped(&bounded, at), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -3895,15 +3896,27 @@ fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
     Some((param, word.index))
 }
 
+#[cfg(all(test, windows))]
+mod indirect_signature_tests;
+
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
+/// once and kept for good. Each thread remembers the last one it asked
+/// for: the title's threads ask for the same few, and the lock and the
+/// object's reference count were shared by all of them.
+fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
+    type Made = ((u32, u32), &'static ID3D12CommandSignature);
+    thread_local! {
+        static LAST: std::cell::Cell<Option<Made>> = const { std::cell::Cell::new(None) };
+    }
+    if let Some((_, s)) = LAST.get().filter(|(k, _)| *k == (kind, stride)) {
+        return Some(s);
+    }
+    static MADE: std::sync::Mutex<Vec<Made>> = std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
+    if let Some(&m) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+        LAST.set(Some(m));
+        return Some(m.1);
     }
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
@@ -3928,9 +3941,10 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    let m = ((kind, stride), &*Box::leak(Box::new(signature?)));
+    made.push(m);
+    LAST.set(Some(m));
+    Some(m.1)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
