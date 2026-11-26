@@ -149,7 +149,7 @@ impl Lower<'_> {
 
     /// Reads an IEEE-754 binary64 operand as `(lo, hi)` 32-bit words, applying
     /// `abs` and `neg` input modifiers on operand `k`.
-    fn f64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+    pub(super) fn f64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -167,7 +167,11 @@ impl Lower<'_> {
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))?
             }
-            Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
+            Operand::Const(code @ 128..=208) => {
+                let lo = crate::resource::inline(code).ok_or("an inline integer operand")?;
+                let hi = (lo as i32 >> 31) as u32;
+                (self.s.m.i32(lo), self.s.m.i32(hi))
+            }
             Operand::Const(c @ 240..=248) => {
                 const INLINE_F64: [f64; 9] = [
                     0.5,

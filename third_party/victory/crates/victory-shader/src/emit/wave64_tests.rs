@@ -1018,6 +1018,35 @@ fn paired_lanes_permute_shift_and_write_lanes_of_both_halves() {
     eprintln!("ran on the hardware device: permutes, row masks, swizzles and lane writes as on the console");
 }
 
+#[test]
+fn paired_cmpx_class_f64_filters_both_halves() {
+    // In each half, lane 0 holds +0 and the other lanes hold positive subnormals.
+    let mut words = vec![
+        vop2(0x1B, 1, k(31), 0), // v_and_b32 v1, 31, v0: binary64 low dword
+        vop1(0x01, 2, k(0)),    // v_mov_b32 v2, 0: binary64 high dword
+        vop1(0x01, 3, 0),       // v_mov_b32 v3, s0: class mask
+        vop1(0x01, 4, k(0)),
+        sop1(0x04, 12, EXEC),   // save exec
+        0xD4B8_007E, 0x0202_0701, // v_cmpx_class_f64_e64 v[1:2], v3
+        vop1(0x01, 4, k(1)),    // write 1 only in matching lanes
+        sop1(0x04, EXEC, 12),   // restore exec so all lanes store
+    ];
+    words.extend(stores([4, 0, 1, 2]));
+    let shader = paired(&native(&words));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (class, select_zero) in [(6, true), (7, false)] {
+        let Some(got) = run_paired(&shader, [1 << class, 0, 0, 0], 256) else { return };
+        let want: Vec<u32> = (0..64)
+            .flat_map(|lane| {
+                let fraction = lane & 31;
+                [u32::from((fraction == 0) == select_zero), lane, fraction, 0]
+            })
+            .collect();
+        same_as_console(&got, &want);
+    }
+    eprintln!("ran on the hardware device: CMPX matched in all 64 console lanes for both masks");
+}
+
 /// [`program`]'s wave OR inside a per-lane branch, in the paired form: the OR of both halves'
 /// lanes, whichever take the branch; nothing stored when none does.
 #[test]

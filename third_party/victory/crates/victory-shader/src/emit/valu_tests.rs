@@ -1426,6 +1426,88 @@ fn v_cmp_class_f16_matches_rdna2() {
 }
 
 #[test]
+fn v_cmp_class_f64_matches_rdna2() {
+    // v_cmp_class_f64_e64 s6, v[1:2], v3; turn its result into a stored 0 or 1.
+    let cmp = vop3(0x0a8, 6, vgpr(1), vgpr(3), 0x80);
+    let select = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+    let shader = build_valu_cs(&[cmp, select].concat());
+    // AMD RDNA 2 ISA §12.9. Include NaNs and subnormals with payloads only in the low dword.
+    let classes = [
+        (0x7ff0_0000_0000_0001u64, 0), // signaling NaN
+        (0xfff0_0000_0000_0001, 0),    // negative signaling NaN
+        (0x7ff8_0000_0000_0000, 1),    // quiet NaN
+        (0xfff8_0000_0000_0001, 1),    // negative quiet NaN
+        (0xfff0_0000_0000_0000, 2),    // negative infinity
+        (0xbff0_0000_0000_0000, 3),    // negative normal
+        (0x8000_0000_0000_0001, 4),    // negative subnormal
+        (0x8000_0000_0000_0000, 5),    // negative zero
+        (0x0000_0000_0000_0000, 6),    // positive zero
+        (0x0000_0000_0000_0001, 7),    // positive subnormal
+        (0x3ff0_0000_0000_0000, 8),    // positive normal
+        (0x7ff0_0000_0000_0000, 9),    // positive infinity
+    ];
+    let cases: Vec<_> = classes
+        .into_iter()
+        .flat_map(|(bits, class)| {
+            let (lo, hi) = (bits as u32, (bits >> 32) as u32);
+            let bit = 1 << class;
+            [[lo, hi, bit, 0], [lo, hi, !bit, 0]]
+        })
+        .collect();
+    run_cases(&shader, &cases, |backend, i, [lo, hi, mask, _], got| {
+        assert_eq!(got, u32::from(i % 2 == 0), "{backend}: {hi:08x}{lo:08x}, mask {mask:#x}");
+    });
+
+    // abs and neg both apply to the source's sign bit, even for zero and NaNs.
+    let modified = vop3_mod(0x0a8, 6, vgpr(1), vgpr(3), 0x80, 1, 1, 0, false);
+    let shader = build_valu_cs(&[modified, select].concat());
+    let cases = [
+        [0, 0xbff0_0000, 1 << 3, 0], // -abs(-1.0) remains negative
+        [0, 0, 1 << 5, 0],           // -abs(+0.0) is negative zero
+        [1, 0x7ff0_0000, 1, 0],      // -abs(sNaN) is still signaling
+        [1, 0x7ff0_0000, 1 << 1, 0],
+    ];
+    run_cases(&shader, &cases, |backend, i, input, got| {
+        assert_eq!(got, u32::from(i < 3), "{backend}: abs/neg {input:x?}");
+    });
+}
+
+#[test]
+fn v_cmp_class_f64_accepts_inline_sources_and_literals() {
+    let select = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+    for (source, literal, class) in [
+        (129, None, 7),                  // inline 1 is a positive subnormal
+        (193, None, 1),                  // inline -1 sign-extends to a quiet NaN
+        (240, None, 8),                  // inline 0.5 is a positive normal
+        (255, Some(0xfff0_0000), 2),     // the literal supplies the high dword of -inf
+    ] {
+        let mut body = vop3(0x0a8, 6, source, vgpr(3), 0x80).to_vec();
+        body.extend(literal);
+        body.extend(select);
+        let shader = build_valu_cs(&body);
+        let cases = [[0, 0, 1 << class, 0], [0, 0, !(1 << class), 0]];
+        run_cases(&shader, &cases, |backend, i, [_, _, mask, _], got| {
+            assert_eq!(got, u32::from(i == 0), "{backend}: source {source}, mask {mask:#x}");
+        });
+    }
+}
+
+#[test]
+fn v_cmpx_class_f64_updates_exec() {
+    let shader = build_valu_cs(&[
+        s_mov_b32(6, 126),      // save exec_lo
+        vop1(0x001, 0, 0x80),   // v0 = 0
+        0x7d70_0701,           // v_cmpx_class_f64_e32 v[1:2], v3
+        vop1(0x001, 0, 0x81),   // v0 = 1 under the new EXEC
+        s_mov_b32(126, 6),      // restore exec_lo for the store
+    ]);
+    let cases = [[1, 0, 1 << 7, 0], [1, 0, 1 << 6, 0]];
+    run_cases(&shader, &cases, |backend, i, input, got| {
+        assert_eq!(got, u32::from(i == 0), "{backend}: CMPX {input:x?}");
+    });
+}
+
+#[test]
 fn v_cvt_f32_f64_matches_ieee754() {
     // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f -> VOP3 opcode 0x18f).
     let plain = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);

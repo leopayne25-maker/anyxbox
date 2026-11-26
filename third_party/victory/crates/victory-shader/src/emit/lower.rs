@@ -8766,45 +8766,50 @@ impl<'a> Lower<'a> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
         let r = match ty {
-            "f32" | "f16" if op == "class" => {
+            "f16" | "f32" | "f64" if op == "class" => {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
-                let f16 = ty == "f16";
-                let x = if f16 {
-                    let Fields::Valu(v) = &inst.fields else {
-                        unreachable!()
-                    };
-                    let mut h = self.half_src(inst, 0)?;
-                    if v.abs & 1 != 0 {
-                        let m = self.s.m.i32(0x7FFF);
-                        h = self.s.m.bin(c, Bin::And, h, m);
+                let (x, lo, exp_sh, sign_sh, exp_mask) = match ty {
+                    "f16" => {
+                        let Fields::Valu(v) = &inst.fields else {
+                            unreachable!()
+                        };
+                        let mut h = self.half_src(inst, 0)?;
+                        if v.abs & 1 != 0 {
+                            let m = self.s.m.i32(0x7FFF);
+                            h = self.s.m.bin(c, Bin::And, h, m);
+                        }
+                        if v.neg & 1 != 0 {
+                            let s = self.s.m.i32(0x8000);
+                            h = self.s.m.bin(c, Bin::Xor, h, s);
+                        }
+                        (h, None, 10, 15, 0x1F)
                     }
-                    if v.neg & 1 != 0 {
-                        let s = self.s.m.i32(0x8000);
-                        h = self.s.m.bin(c, Bin::Xor, h, s);
+                    "f64" => {
+                        let (lo, hi) = self.f64_pair(inst, 0)?;
+                        (hi, Some(lo), 20, 31, 0x7FF)
                     }
-                    h
-                } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    _ => {
+                        let x = self.fsrc(inst, 0)?;
+                        (self.as_int(x), None, 23, 31, 0xFF)
+                    }
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
-                    (10, 15, 0x1F, 0x03FF, 0x0200)
-                } else {
-                    (23, 31, 0xFF, 0x7F_FFFF, 0x40_0000)
-                };
                 let (k_exp, k_sign, k_emax, mant, quiet) = (
                     k(self, exp_sh),
                     k(self, sign_sh),
                     k(self, exp_mask),
-                    k(self, mant_mask),
-                    k(self, quiet_bit),
+                    k(self, (1 << exp_sh) - 1),
+                    k(self, 1 << (exp_sh - 1)),
                 );
                 let e = self.s.m.bin(c, Bin::LShr, x, k_exp);
                 let e = self.s.m.bin(c, Bin::And, e, k_emax);
-                let m = self.s.m.bin(c, Bin::And, x, mant);
+                let mut m = self.s.m.bin(c, Bin::And, x, mant);
+                if let Some(lo) = lo {
+                    // Test the full binary64 fraction for zero using two i32 words.
+                    m = self.s.m.bin(c, Bin::Or, m, lo);
+                }
                 let neg = self.s.m.bin(c, Bin::LShr, x, k_sign);
                 let zero = k(self, 0);
                 let (e0, emax) = (
