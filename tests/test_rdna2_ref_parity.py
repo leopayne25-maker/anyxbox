@@ -443,6 +443,27 @@ def test_random_scalar_programs_match_the_python_model():
         assert_same(exe, lanes, scc, scalars, words)
 
 
+def test_indexed_registers_past_32_bits_are_refused_by_both_models():
+    """M0 is a full 32-bit value: a register number plus M0 past 2^32 is outside the model in both
+    interpreters, never the register a wrapping 32-bit sum would give (47 + 0xFFFFFFFD is not s44)."""
+    exe = binary()
+    cases = [
+        program(sop1("s_movrels_b32", 102, 47)), program(sop1("s_movrels_b64", 102, 47)),
+        program(sop1("s_movreld_b32", 47, 44)), program(sop1("s_movreld_b64", 47, 44)),
+        program(vop1("v_movrels_b32", 5, V0 + 3)), program(vop1("v_movreld_b32", 5, V0 + 3)),
+        program(vop1("v_movrelsd_b32", 5, V0 + 3)),
+    ]
+    registers = [(44, 0x1234_5678), (45, 0x9ABC_DEF0), (47, 0x0BAD_F00D)]
+    for words in cases:
+        for m0 in (0xFFFF_FFFD, 0xFFFF_FFFF, 0x8000_0000):
+            scalars = [(124, m0), *registers]
+            assert run_python(32, False, scalars, words) == "error untranslated\n"
+            assert_same(exe, 32, False, scalars, words)
+        in_range = [(124, 1), *registers]
+        assert run_python(32, False, in_range, words).startswith("steps")
+        assert_same(exe, 32, False, in_range, words)
+
+
 def test_vop3_literal_operations_match_the_python_model():
     """VOP3 v_madmk/madak/fmamk/fmaak_f32: refused without a literal, matching with a literal operand."""
     exe = binary()
