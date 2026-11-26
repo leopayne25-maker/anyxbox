@@ -51,6 +51,7 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 | zm0kie | GPL-3.0 | Overlay (F10), envois de fenêtres, lignes mémoire, `tools/` (`start-neptune.ps1`, `memwatch.ps1`) | |
 | [skornuta/victory-fork](https://github.com/skornuta/victory-fork) (skornuta) | GPL-3.0 | Export des temps d'image (`VICTORY_FRAMETIME_DUMP`) | |
 | Trexies | GPL-3.0 | Petits tampons regroupés | |
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory/commit/94c1ead4ed8499f2ae3c05d4d5f99b28164cc2cf) (Flare) | GPL-3.0 ou ultérieure | | Filtrage mip par point des samplers anisotropes dans les tas de descripteurs |
 | Le correctif de redirection FidelityFX reçu pour DexNom Runtime | GPL-3.0 | `VICTORY_FSR_DLL` (mode Series S, non utilisé par le lanceur) | |
 | [LooperSalty/victory](https://github.com/LooperSalty/victory) (Looper_Salty) | GPL-3.0 ou ultérieure | | Les quatre commits `xg:` (`19feca8`, `1f0fe1d`, `36955ee`, `fb021f7`) : `xg_xs.dll` du GDK de l'utilisateur comme oracle ou service (`VICTORY_XG_DLL`, `VICTORY_XG_MODE`, jamais copiée dans le dépôt) et HLE qui répond comme la DLL de Microsoft |
 

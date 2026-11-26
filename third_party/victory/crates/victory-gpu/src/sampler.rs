@@ -27,7 +27,7 @@ struct Fields {
 }
 
 impl Fields {
-    fn host(&self) -> D3D12_SAMPLER_DESC {
+    fn host(&self, aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
         let linear = |f: u32| u32::from(f == 1 || f == 3);
         let aniso = self.mag >= 2 || self.min >= 2;
         // The console compares when the instruction says so, with the
@@ -43,7 +43,10 @@ impl Fields {
             _ => u32::from(compares),
         };
         let filter = if aniso {
-            0x55
+            // Bit 0 selects linear mips, which are also the fallback on
+            // devices without the optional anisotropic point-mip filter.
+            D3D12_FILTER_MIN_MAG_ANISOTROPIC_MIP_POINT.0 as u32
+                | u32::from(self.mip == 2 || !aniso_point_mip)
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
@@ -61,7 +64,7 @@ impl Fields {
             ComparisonFunc: D3D12_COMPARISON_FUNC(self.compare.max(1) as i32),
             BorderColor: self.border,
             MinLOD: self.min_lod,
-            // Without a mip filter the console samples mip 0 only.
+            // Fix the LOD to its minimum when the title disables mip filtering.
             MaxLOD: if self.mip == 0 {
                 self.min_lod
             } else {
@@ -71,11 +74,30 @@ impl Fields {
     }
 }
 
+/// Query the optional filter once for the runtime's single D3D12 device.
+pub(crate) fn aniso_point_mip(device: &ID3D12Device) -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: storage of the correct size for OPTIONS19. Older
+        // runtimes may reject the query and use the linear fallback.
+        unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool()
+    })
+}
+
 /// The console's sampler description (27 words): flags, magnification,
 /// minification, mip and depth filters, filter mode, three address modes,
 /// minimum and maximum LOD, LOD bias, secondary bias, anisotropy, its bias
 /// and threshold, comparison, border color, then tuning words.
-pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
+pub(crate) fn console(words: &[u32; 27], aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
     let f = |i: usize| f32::from_bits(words[i]);
     Fields {
         mag: words[1],
@@ -90,7 +112,7 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
         compare: words[16],
         border: [f(17), f(18), f(19), f(20)],
     }
-    .host()
+    .host(aniso_point_mip)
 }
 
 #[cfg(test)]
@@ -105,15 +127,46 @@ mod tests {
         w[3] = 2; // linear mips
         w[6..9].copy_from_slice(&[3, 3, 3]);
         w[10] = 1000.0f32.to_bits();
-        let d = console(&w);
+        let d = console(&w, false);
         assert_eq!(d.Filter.0, 0x5, "min point, mag and mip linear");
         assert_eq!(d.AddressW, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
         assert_eq!(d.MaxLOD, 1000.0);
         // A less-or-equal test makes a comparison sampler; never does not.
         w[16] = 4;
-        assert_eq!(console(&w).Filter.0, 0x85);
-        assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+        assert_eq!(console(&w, false).Filter.0, 0x85);
+        assert_eq!(
+            console(&w, false).ComparisonFunc,
+            D3D12_COMPARISON_FUNC_LESS_EQUAL
+        );
         w[16] = 1;
-        assert_eq!(console(&w).Filter.0, 0x5);
+        assert_eq!(console(&w, false).Filter.0, 0x5);
+    }
+
+    #[test]
+    fn anisotropic_mip_filter_respects_device_support() {
+        let mut w = [0u32; 27];
+        w[1] = 3;
+        w[2] = 3;
+        w[9] = 1.5f32.to_bits();
+        w[10] = 3.0f32.to_bits();
+        w[13] = 4;
+        for (mode, compare, point, linear) in [
+            (0, 0, 0x54, 0x55),
+            (0, 4, 0xd4, 0xd5),
+            (1, 0, 0x154, 0x155),
+            (2, 0, 0x1d4, 0x1d5),
+        ] {
+            w[5] = mode;
+            w[16] = compare;
+            for mip in 0..=2 {
+                w[3] = mip;
+                assert_eq!(console(&w, false).Filter.0, linear);
+                let supported = console(&w, true);
+                assert_eq!(supported.Filter.0, if mip == 2 { linear } else { point });
+                if mip == 0 {
+                    assert_eq!((supported.MinLOD, supported.MaxLOD), (1.5, 1.5));
+                }
+            }
+        }
     }
 }
