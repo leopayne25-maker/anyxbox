@@ -308,6 +308,65 @@ fn packed_add_selects_halves_of_inline_constants() {
     }
 }
 
+fn check_signed_i16_add_sub(add: bool) {
+    let op = if add { 0x30d } else { 0x30e }; // v_add_nc_i16 / v_sub_nc_i16
+    let previous = 0xA5A5_5A5A;
+    let operands = [
+        (20, -3),
+        (-20, -3),
+        (i16::MAX, 0),
+        (i16::MIN, 0),
+        (i16::MAX, 1),
+        (i16::MAX, -1),
+        (i16::MIN, 1),
+        (i16::MIN, -1),
+        (i16::MIN, i16::MAX),
+        (i16::MAX, i16::MIN),
+    ];
+    let pack = |x: i16, other: u32, shift: u32| {
+        (u32::from(x as u16) << shift) | (other << (16 - shift))
+    };
+    for half in 0..8u32 {
+        let a_shift = (half & 1) * 16;
+        let b_shift = (half >> 1 & 1) * 16;
+        let dst_shift = (half >> 2 & 1) * 16;
+        let opsel = (half & 3) | ((half & 4) << 1);
+        let inputs = operands.map(|(a, b)| {
+            [pack(a, 0x1357u32, a_shift), pack(b, 0xEAC0u32, b_shift), previous, 0]
+        });
+        for clamp in [false, true] {
+            let [lo, hi] = vop3_mod(op, 0, vgpr(1), vgpr(2), 0, 0, 0, 0, clamp);
+            let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(3)), lo | (opsel << 11), hi]);
+            run_cases(&shader, &inputs, |backend, i, _, got| {
+                let (a, b) = operands[i];
+                let (a, b) = (i32::from(a), i32::from(b));
+                let exact = if add { a + b } else { a - b };
+                let result = if clamp {
+                    exact.clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+                } else {
+                    exact
+                };
+                let preserved = previous & !(0xFFFF << dst_shift);
+                let expected = preserved | (u32::from(result as u16) << dst_shift);
+                assert_eq!(
+                    got, expected,
+                    "{backend}: {op:#x}, op_sel {opsel:#06b}, clamp {clamp}, {a}, {b}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn signed_i16_add_keeps_unselected_half() {
+    check_signed_i16_add_sub(true);
+}
+
+#[test]
+fn signed_i16_sub_keeps_unselected_half() {
+    check_signed_i16_add_sub(false);
+}
+
 /// 64-bit floats, which the title's water volumetrics count their lanes in: `v_add_f64` and
 /// `v_mul_f64` of register pairs (one operand negated, one an inline double),
 /// `v_cvt_f64_f32`, and `v_cvt_f32_f64` rounding to nearest (1 + 0.75 of a float's last

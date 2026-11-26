@@ -7933,6 +7933,8 @@ impl<'a> Lower<'a> {
         const INT: &[&str] = &[
             "v_add_nc_u16",
             "v_sub_nc_u16",
+            "v_add_nc_i16",
+            "v_sub_nc_i16",
             "v_subrev_nc_u16",
             "v_mul_lo_u16",
             "v_lshlrev_b16",
@@ -8128,7 +8130,8 @@ impl<'a> Lower<'a> {
             return self.write_half(inst, r, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        let signed_add_sub = matches!(name, "v_add_nc_i16" | "v_sub_nc_i16");
+        if (v.clamp && !signed_add_sub) || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = {
@@ -8144,8 +8147,8 @@ impl<'a> Lower<'a> {
             }
             let k15 = self.s.m.i32(15);
             match name {
-                "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
-                "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                "v_add_nc_u16" | "v_add_nc_i16" => self.s.m.bin(c, Bin::Add, a, b),
+                "v_sub_nc_u16" | "v_sub_nc_i16" => self.s.m.bin(c, Bin::Sub, a, b),
                 "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                 "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
                 "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
@@ -8174,6 +8177,21 @@ impl<'a> Lower<'a> {
                     self.s.m.select(c, t, a, b)
                 }
             }
+        };
+        let r = if v.clamp {
+            // Select 16-bit patterns before packing. NVIDIA can fuse a signed
+            // clamp and sign-extend its result into the preserved half.
+            let lo = self.s.m.i32(i32::from(i16::MIN) as u32);
+            let hi = self.s.m.i32(i16::MAX as u32);
+            let low_bits = self.s.m.i32(u16::MAX as u32);
+            let masked = self.s.m.bin(c, Bin::And, r, low_bits);
+            let below = self.s.m.cmp(c, pred::SLT, r, lo);
+            let min_bits = self.s.m.i32(u32::from(i16::MIN as u16));
+            let bounded = self.s.m.select(c, below, min_bits, masked);
+            let above = self.s.m.cmp(c, pred::SGT, r, hi);
+            self.s.m.select(c, above, hi, bounded)
+        } else {
+            r
         };
         self.write_half(inst, r, guard)
     }
