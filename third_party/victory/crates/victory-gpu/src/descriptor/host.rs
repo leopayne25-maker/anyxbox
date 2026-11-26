@@ -3075,6 +3075,38 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Whether the host device can create a writable typed UAV in this format.
+fn typed_uav_store(format: DXGI_FORMAT) -> bool {
+    // The runtime uses one D3D12 device. Cache the DXGI formats used by
+    // descriptor writes so repeated views do not query the driver again.
+    static SUPPORT: [std::sync::OnceLock<bool>; 256] =
+        [const { std::sync::OnceLock::new() }; 256];
+    let query = || {
+        let Some(host) = host() else {
+            return false;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: the query writes the given format support structure.
+        let result = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        result.is_ok()
+            && support.Support1.contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+            && support.Support2.contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)
+    };
+    match SUPPORT.get(format.0 as usize) {
+        Some(cached) => *cached.get_or_init(query),
+        None => query(),
+    }
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -3116,25 +3148,26 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    if view == 0 {
-        return !typeless;
+    if view == 0 && typeless {
+        return false;
     }
-    // A view of a target whose format the host refuses, in the title's
-    // format: in the stand-in the host copy has.
-    if view != own && crate::resource::target_format(view) == own {
-        if let Some(format) = format {
-            *format = d.Format;
-        }
-        return true;
-    }
-    if family(view) != family(own) {
+    // A view in the title's format can name the host's stand-in.
+    let stand_in = view != 0 && view != own && crate::resource::target_format(view) == own;
+    if view != 0 && !stand_in && family(view) != family(own) {
         once!(view, own, "view format of another family");
         return false;
     }
+    let resolved = if typeless && !stand_in { DXGI_FORMAT(view as i32) } else { d.Format };
+    // Ask about the format the native call will actually use, after
+    // resolving sRGB, typed resources and target stand-ins.
+    if unordered && !typed_uav_store(resolved) {
+        once!(format = resolved.0, "the host cannot store through this texture UAV format");
+        return false;
+    }
     if let Some(format) = format
-        && !typeless
+        && (view != 0 || unordered)
     {
-        *format = d.Format;
+        *format = resolved;
     }
     true
 }
@@ -3724,6 +3757,10 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
 }
+
+#[cfg(test)]
+#[path = "typed_uav_tests.rs"]
+mod typed_uav_tests;
 
 #[cfg(test)]
 mod tests {
